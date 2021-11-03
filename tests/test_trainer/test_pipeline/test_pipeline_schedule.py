@@ -8,7 +8,7 @@ import torch
 import torch.multiprocessing as mp
 import model
 
-from colossalai.builder import PipelineModelInitializer
+from colossalai.builder import PipelineModel
 from colossalai.communication import p2p as p2p_communication
 from colossalai.communication.utils import send_tensor_meta, recv_tensor_meta
 from colossalai.context.parallel_mode import ParallelMode
@@ -39,7 +39,7 @@ def run_schedule(rank, world_size):
            backend='nccl')
 
     # build model
-    model = PipelineModelInitializer(gpc.config.model, 1).initialize()
+    model = PipelineModel(gpc.config.model, 1)()
     print_rank_0('model is created')
 
     train_dataset = CIFAR10(

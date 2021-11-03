@@ -150,7 +150,7 @@ def _partition_balanced(weights, pipeline_parallel_size, num_chunks):
     return parts
 
 
-class PipelineModelInitializer():
+class PipelineModel():
     """An intializer to split the model into different stages for pipeline parallelism.
 
     An example for the model config is shown below. The class VisionTransformerFromConfig should
@@ -172,7 +172,7 @@ class PipelineModelInitializer():
     :type verbose: bool
 
     """
-
+    
     def __init__(self, config, num_chunks, verbose=False):
         self.num_chunks = num_chunks
         self.ori_model = build_model(config)
@@ -181,6 +181,9 @@ class PipelineModelInitializer():
         self.verbose = verbose
         self._logger = get_dist_logger()
         self._logger.info(f"The total length of layers is {layer_length}", ranks=[0])
+
+    def __call__(self, partition_method='parameter'):
+        return self.initialize(partition_method=partition_method)
 
     def initialize(self, partition_method='parameter'):
         """Initialize the model object from the config passed
@@ -225,7 +228,7 @@ class PipelineModelInitializer():
 
                 log_str += f'\n===== stage={stage}, layers={num_layers} =====\n'
                 for st, ed in self.parts[stage]:
-                    for idx, layer in enumerate(self.layers[st: ed]):
+                    for idx, layer in enumerate(self.layers[st:ed]):
                         log_str += f'\t{idx + st:2d}: {layer}\n'
             self._logger.info(log_str, ranks=[0])
 
