@@ -15,13 +15,13 @@ from colossalai.engine import Engine
 from colossalai.logging import get_global_dist_logger
 from colossalai.trainer import Trainer
 from colossalai.trainer.metric import Accuracy3D
-from colossalai.utils import print_rank_0
+from colossalai.utils import print_rank_0, report_memory_usage
 
 
 CONFIG_PATH = Path(__file__).parent.parent.joinpath('configs/vit_3d.py')
 
 
-def _train_epoch(epoch, engine):
+def _train_epoch(epoch, engine, profiler=None):
     logger = get_global_dist_logger()
     print_rank_0('[Epoch %d] training start' % (epoch), logger)
     engine.train()
@@ -31,13 +31,15 @@ def _train_epoch(epoch, engine):
     num_samples = 0
     now = time.time()
     epoch_start = now
-    progress = range(engine.schedule.num_steps)
+    progress = range(16)
     if gpc.get_global_rank() == 0:
         progress = tqdm(progress, desc='[Epoch %d]' % epoch, miniters=1)
     for step in progress:
         cur_lr = engine.get_lr()
 
         _, targets, loss = engine.step()
+        if profiler is not None:
+            profiler.step()
 
         batch_size = targets[0].size(0)
         train_loss += loss.item()
@@ -59,6 +61,8 @@ def _train_epoch(epoch, engine):
     print_rank_0(
         '[Epoch %d] Loss: %.3f | Throughput: %.3f (samples/sec)' %
         (epoch, epoch_loss, epoch_throughput), logger)
+    if gpc.get_global_rank() == 0:
+        report_memory_usage('Memory usage')
 
 
 def _eval(epoch, engine):
@@ -117,12 +121,14 @@ def test_epoch():
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ],
+            schedule=torch.profiler.schedule(wait=1, warmup=5, active=10),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./log_3d_8'),
             record_shapes=True,
             # profile_memory=True,
             with_flops=True,
-            # with_modules=True,
+            with_modules=True,
         ) as prof:
-            _train_epoch(0, engine)
+            _train_epoch(0, engine, prof)
 
         torch.cuda.synchronize()
     # trainer.fit(train_dataloader=train_dataloader,
@@ -140,8 +146,76 @@ def test_epoch():
         torch.cuda.synchronize()
         torch.distributed.barrier()
 
-def test_linear():
-    pass
+def test_allgather_n_broadcast():
+    from colossalai.communication import all_gather
+    from colossalai.initialize import init_dist
+    from colossalai.utils import get_current_device
+    from tqdm import trange
+
+    init_dist(config=CONFIG_PATH)
+    
+    logger = get_global_dist_logger()
+
+    BATCH_SIZE = 4024
+    HIDDEN_SIZE = 512
+    DEPTH = torch.distributed.get_world_size()
+    SEQ_LENGTH = 128
+
+    logger.info("Test start", ranks=[0])
+    if gpc.get_global_rank() == 0:
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(wait=1, warmup=5, active=10, repeat=2),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./log_allgather_n_broadcast_1'),
+            record_shapes=True,
+            # profile_memory=True,
+            with_flops=True,
+            with_modules=True,
+        ) as prof:
+            tensor_shape = (BATCH_SIZE, SEQ_LENGTH, HIDDEN_SIZE // DEPTH)
+            for _ in trange(16):
+                x = torch.randn(tensor_shape, dtype=torch.float, device=get_current_device())
+                x = all_gather(x, -1, ParallelMode.GLOBAL)
+                prof.step()
+
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+            tensor_shape = (BATCH_SIZE, SEQ_LENGTH, HIDDEN_SIZE)
+            for _ in trange(16):
+                x = torch.randn(tensor_shape, dtype=torch.float, device=get_current_device())
+                x = x.clone()
+                torch.distributed.broadcast(x, src=0)
+                prof.step()
+
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        
+        print('Test complete. Generating profiling report ...')
+        print(prof.key_averages(group_by_input_shape=True).table(sort_by="cuda_time_total"))
+        torch.distributed.barrier()
+    else:
+        tensor_shape = (BATCH_SIZE, SEQ_LENGTH, HIDDEN_SIZE // DEPTH)
+        for _ in range(16):
+            x = torch.randn(tensor_shape, dtype=torch.float, device=get_current_device())
+            x = all_gather(x, -1, ParallelMode.GLOBAL)
+        
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+        tensor_shape = (BATCH_SIZE, SEQ_LENGTH, HIDDEN_SIZE)
+        for _ in range(16):
+            x = torch.randn(tensor_shape, dtype=torch.float, device=get_current_device())
+            x = x.clone()
+            torch.distributed.broadcast(x, src=0)
+        
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.distributed.barrier()
 
 if __name__ == '__main__':
     test_epoch()
+    # test_allgather_n_broadcast()

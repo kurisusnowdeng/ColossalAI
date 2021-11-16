@@ -28,7 +28,7 @@ def all_gather(tensor: Tensor, dim: int,
     temp = tensor.clone()
     shape = list(temp.shape)
     shape[dim] *= depth
-    out = torch.empty(shape, dtype=temp.dtype, device=get_current_device())
+    out = torch.zeros(shape, dtype=temp.dtype, device=get_current_device())
     out = list(torch.chunk(out, depth, dim=dim))
     out = [val.contiguous() for val in out]
     dist.all_gather(out, temp, group=gpc.get_group(parallel_mode))
@@ -53,7 +53,7 @@ def reduce_scatter(tensor: Tensor, dim: int,
     depth = gpc.get_world_size(parallel_mode)
     temp = list(torch.chunk(tensor, depth, dim=dim))
     temp = [val.contiguous() for val in temp]
-    out = torch.empty(temp[0].shape,
+    out = torch.zeros(temp[0].shape,
                       dtype=temp[0].dtype,
                       device=get_current_device())
     dist.reduce_scatter(output=out,

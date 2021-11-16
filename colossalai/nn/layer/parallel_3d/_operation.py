@@ -29,7 +29,7 @@ class Matmul_AB_3D(torch.autograd.Function):
         # A: [m/q^2, n, k/q]
         # B: [k/q, h/q^2]
         # C: [m/q^2, n, h/q]
-        empty_cache()
+        # empty_cache()
         ctx.save_for_backward(A, B)
 
         assert A.shape[-1] == B.shape[0], \
@@ -54,17 +54,17 @@ class Matmul_AB_3D(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, output_grad: Tensor) -> Tuple[Tensor, ...]:
         A, B = ctx.saved_tensors
-        with torch.no_grad():
-            A_grad = Matmul_ABT_3D.apply(output_grad, B, ctx.depth,
-                                         ctx.C_group_parallel_mode,
-                                         ctx.B_group_parallel_mode,
-                                         ctx.A_group_parallel_mode, ctx.C_dim,
-                                         ctx.B_dim, ctx.A_dim)
-            B_grad = Matmul_ATB_3D.apply(A, output_grad, ctx.depth,
-                                         ctx.A_group_parallel_mode,
-                                         ctx.C_group_parallel_mode,
-                                         ctx.B_group_parallel_mode, ctx.A_dim,
-                                         ctx.C_dim, ctx.B_dim)
+        # with torch.no_grad():
+        A_grad = Matmul_ABT_3D.apply(output_grad, B, ctx.depth,
+                                        ctx.C_group_parallel_mode,
+                                        ctx.B_group_parallel_mode,
+                                        ctx.A_group_parallel_mode, ctx.C_dim,
+                                        ctx.B_dim, ctx.A_dim)
+        B_grad = Matmul_ATB_3D.apply(A, output_grad, ctx.depth,
+                                        ctx.A_group_parallel_mode,
+                                        ctx.C_group_parallel_mode,
+                                        ctx.B_group_parallel_mode, ctx.A_dim,
+                                        ctx.C_dim, ctx.B_dim)
         return A_grad, B_grad, None, None, None, None, None, None, None
 
 
@@ -85,7 +85,7 @@ class Matmul_ABT_3D(torch.autograd.Function):
         # A: [m/q^2, n, h/q]
         # B: [k/q, h/q^2]
         # C: [m/q^2, n, k/q]
-        empty_cache()
+        # empty_cache()
         ctx.save_for_backward(A, B)
 
         A_temp = all_gather(A, input_dim, input_parallel_mode)
@@ -107,17 +107,17 @@ class Matmul_ABT_3D(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, output_grad: Tensor) -> Tuple[Tensor, ...]:
         A, B = ctx.saved_tensors
-        with torch.no_grad():
-            A_grad = Matmul_AB_3D.apply(output_grad, B, ctx.depth,
+        # with torch.no_grad():
+        A_grad = Matmul_AB_3D.apply(output_grad, B, ctx.depth,
+                                    ctx.C_group_parallel_mode,
+                                    ctx.B_group_parallel_mode,
+                                    ctx.A_group_parallel_mode, ctx.C_dim,
+                                    ctx.B_dim, ctx.A_dim)
+        B_grad = Matmul_ATB_3D.apply(output_grad, A, ctx.depth,
                                         ctx.C_group_parallel_mode,
-                                        ctx.B_group_parallel_mode,
-                                        ctx.A_group_parallel_mode, ctx.C_dim,
-                                        ctx.B_dim, ctx.A_dim)
-            B_grad = Matmul_ATB_3D.apply(output_grad, A, ctx.depth,
-                                         ctx.C_group_parallel_mode,
-                                         ctx.A_group_parallel_mode,
-                                         ctx.B_group_parallel_mode, ctx.C_dim,
-                                         ctx.A_dim, ctx.B_dim)
+                                        ctx.A_group_parallel_mode,
+                                        ctx.B_group_parallel_mode, ctx.C_dim,
+                                        ctx.A_dim, ctx.B_dim)
         return A_grad, B_grad, None, None, None, None, None, None, None
 
 
@@ -138,7 +138,7 @@ class Matmul_ATB_3D(torch.autograd.Function):
         # A: [m/q^2, n, k/q]
         # B: [m/q^2, n, h/q]
         # C: [k/q, h/q^2]
-        empty_cache()
+        # empty_cache()
         ctx.save_for_backward(A, B)
 
         A_temp = all_gather(A, input_dim, input_parallel_mode)
@@ -162,17 +162,17 @@ class Matmul_ATB_3D(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, output_grad: Tensor) -> Tuple[Tensor, ...]:
         A, B = ctx.saved_tensors
-        with torch.no_grad():
-            A_grad = Matmul_ABT_3D.apply(B, output_grad, ctx.depth,
-                                         ctx.B_group_parallel_mode,
-                                         ctx.C_group_parallel_mode,
-                                         ctx.A_group_parallel_mode, ctx.B_dim,
-                                         ctx.C_dim, ctx.A_dim)
-            B_grad = Matmul_AB_3D.apply(A, output_grad, ctx.depth,
-                                        ctx.A_group_parallel_mode,
+        # with torch.no_grad():
+        A_grad = Matmul_ABT_3D.apply(B, output_grad, ctx.depth,
+                                        ctx.B_group_parallel_mode,
                                         ctx.C_group_parallel_mode,
-                                        ctx.B_group_parallel_mode, ctx.A_dim,
-                                        ctx.C_dim, ctx.B_dim)
+                                        ctx.A_group_parallel_mode, ctx.B_dim,
+                                        ctx.C_dim, ctx.A_dim)
+        B_grad = Matmul_AB_3D.apply(A, output_grad, ctx.depth,
+                                    ctx.A_group_parallel_mode,
+                                    ctx.C_group_parallel_mode,
+                                    ctx.B_group_parallel_mode, ctx.A_dim,
+                                    ctx.C_dim, ctx.B_dim)
         return A_grad, B_grad, None, None, None, None, None, None, None
 
 
@@ -243,7 +243,7 @@ class Mul_3D(torch.autograd.Function):
         # [h/q]
         bias_temp = all_gather(bias_temp, -1, weight_parallel_mode)
 
-        empty_cache()
+        # empty_cache()
         ctx.save_for_backward(input_, bias_temp)
 
         out = torch.mul(input_, bias_temp)
