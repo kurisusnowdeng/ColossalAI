@@ -17,7 +17,6 @@ DROP_RATE = 0.1
 BATCH_SIZE = 512
 LEARNING_RATE = 0.001
 DATASET_PATH = Path(os.environ['DATA'])
-
 model = dict(
     type='VisionTransformerFromConfig',
     embedding_cfg=dict(
