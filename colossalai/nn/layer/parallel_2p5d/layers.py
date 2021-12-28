@@ -13,11 +13,11 @@ from colossalai.utils import get_current_device
 from torch import Tensor, dtype
 from torch.nn import Parameter
 
-from .._common_utils import (divide, set_tensor_parallel_attribute_by_partition, to_2tuple)
+from ..utils import divide, set_tensor_parallel_attribute_by_partition, to_2tuple
 from ..base_layer import ParallelLayer
 from ._operation import (Add_Bias_2p5D, Matmul_AB_2p5D, all_gather_weight_2p5d, classifier_2p5d, layernorm_2p5d,
                          split_batch_2p5d)
-from ._utils import (assert_tesseract_initialization, get_tesseract_dim_dep_from_env)
+from ._utils import assert_tesseract_initialization, get_tesseract_dim_dep_from_env
 
 
 @LAYERS.register_module
@@ -231,7 +231,7 @@ class PatchEmbedding2p5D(ParallelLayer):
         self.num_patches = self.grid_size[0] * self.grid_size[1]
         self.flatten = flatten
         self.embed_size = embed_size
-        self.embed_size_per_partition = embed_size // (self.tesseract_dep * self.tesseract_dim**2)
+        self.embed_size_per_partition = embed_size // self.tesseract_dim**2
 
         with seed(ParallelMode.TENSOR):
             self.weight = Parameter(
@@ -251,10 +251,10 @@ class PatchEmbedding2p5D(ParallelLayer):
         self._set_tensor_parallel_attribute()
 
     def _set_tensor_parallel_attribute(self):
-        set_tensor_parallel_attribute_by_partition(self.weight, self.tesseract_dep * self.tesseract_dim**2)
-        set_tensor_parallel_attribute_by_partition(self.bias, self.tesseract_dep * self.tesseract_dim**2)
-        set_tensor_parallel_attribute_by_partition(self.cls_token, self.tesseract_dep * self.tesseract_dim**2)
-        set_tensor_parallel_attribute_by_partition(self.pos_embed, self.tesseract_dep * self.tesseract_dim**2)
+        set_tensor_parallel_attribute_by_partition(self.weight, self.tesseract_dim**2)
+        set_tensor_parallel_attribute_by_partition(self.bias, self.tesseract_dim**2)
+        set_tensor_parallel_attribute_by_partition(self.cls_token, self.tesseract_dim**2)
+        set_tensor_parallel_attribute_by_partition(self.pos_embed, self.tesseract_dim**2)
 
     def reset_parameters(self, weight_initializer, bias_initializer, position_embed_initializer):
         with seed(ParallelMode.TENSOR):
@@ -303,7 +303,7 @@ class Embedding2p5D(ParallelLayer):
         self.tesseract_dim, self.tesseract_dep = get_tesseract_dim_dep_from_env()
         self.num_embeddings = num_embeddings
         self.embed_dim = embedding_dim
-        embed_dim_per_partition = embedding_dim // (self.tesseract_dep * self.tesseract_dim**2)
+        embed_dim_per_partition = embedding_dim // self.tesseract_dim**2
 
         self.padding_idx = padding_idx
         self.embed_args = args
@@ -316,7 +316,7 @@ class Embedding2p5D(ParallelLayer):
         self._set_tensor_parallel_attributes()
 
     def _set_tensor_parallel_attributes(self):
-        set_tensor_parallel_attribute_by_partition(self.weight, self.tesseract_dep * self.tesseract_dim**2)
+        set_tensor_parallel_attribute_by_partition(self.weight, self.tesseract_dim**2)
 
     def reset_parameters(self, weight_initializer) -> None:
         with seed(ParallelMode.TENSOR):
@@ -359,7 +359,7 @@ class Classifier2p5D(ParallelLayer):
         self.tesseract_dim, self.tesseract_dep = get_tesseract_dim_dep_from_env()
 
         # partitioning dimension
-        self.input_size_per_partition = divide(self.in_features, self.tesseract_dep * self.tesseract_dim**2)
+        self.input_size_per_partition = divide(self.in_features, self.tesseract_dim**2)
 
         if weight is not None:
             self.weight = weight
@@ -378,7 +378,7 @@ class Classifier2p5D(ParallelLayer):
 
     def _set_tensor_parallel_attributes(self):
         if self.has_weight:
-            set_tensor_parallel_attribute_by_partition(self.weight, self.tesseract_dep * self.tesseract_dim**2)
+            set_tensor_parallel_attribute_by_partition(self.weight, self.tesseract_dim**2)
 
     def reset_parameters(self, weight_initializer, bias_initializer) -> None:
         with seed(ParallelMode.TENSOR):
