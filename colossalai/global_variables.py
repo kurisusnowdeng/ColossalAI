@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Iterable, Optional
 
 
 class TensorParallelEnv(object):
@@ -16,10 +16,13 @@ class TensorParallelEnv(object):
              mode: Optional[str] = None,
              vocab_parallel: bool = False,
              parallel_input_1d: bool = False,
+             data_shape_1d: Optional[Iterable[int]] = None,
+             scatter_activation_1d: bool = False,
              summa_dim: int = None,
              tesseract_dim: int = None,
              tesseract_dep: int = None,
              depth_3d: int = None,
+             async_3d: bool = False,
              input_group_3d=None,
              weight_group_3d=None,
              output_group_3d=None,
@@ -28,10 +31,13 @@ class TensorParallelEnv(object):
         self.mode = mode
         self.vocab_parallel = vocab_parallel
         self.parallel_input_1d = parallel_input_1d
+        self.data_shape_1d = data_shape_1d
+        self.scatter_activation_1d = scatter_activation_1d
         self.summa_dim = summa_dim
         self.tesseract_dim = tesseract_dim
         self.tesseract_dep = tesseract_dep
         self.depth_3d = depth_3d
+        self.async_3d = async_3d
         self.input_group_3d = input_group_3d
         self.weight_group_3d = weight_group_3d
         self.output_group_3d = output_group_3d
@@ -42,10 +48,13 @@ class TensorParallelEnv(object):
         return dict(mode=self.mode,
                     vocab_parallel=self.vocab_parallel,
                     parallel_input_1d=self.parallel_input_1d,
+                    data_shape_1d=self.data_shape_1d,
+                    scatter_activation_1d=self.scatter_activation_1d,
                     summa_dim=self.summa_dim,
                     tesseract_dim=self.tesseract_dim,
                     tesseract_dep=self.tesseract_dep,
                     depth_3d=self.depth_3d,
+                    async_3d=self.async_3d,
                     input_group_3d=self.input_group_3d,
                     weight_group_3d=self.weight_group_3d,
                     output_group_3d=self.output_group_3d,

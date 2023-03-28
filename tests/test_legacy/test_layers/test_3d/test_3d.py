@@ -23,7 +23,11 @@ from colossalai.testing import rerun_if_address_is_in_use, skip_if_not_enough_gp
 CONFIG = dict(
     parallel=dict(
         pipeline=1,
-        tensor=dict(mode='3d', size=8),
+        tensor=dict(
+            mode='3d',
+            size=8,
+            enable_async=True,
+        ),
     ),
     seed=42,
 )
@@ -31,8 +35,8 @@ CONFIG = dict(
 
 def check_layer():
     check_linear()
-    check_layernorm()
     check_classifier_no_given_weight()
+    check_layernorm()
     check_vocab_parallel_classifier_no_given_weight()
     check_vocab_parallel_classifier_given_embed_weight()
     check_embed()

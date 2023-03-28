@@ -23,9 +23,10 @@ class Initializer_1D(ProcessGroupInitializer):
         tensor_parallel_size (int): Size of tensor parallel.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, scatter_activation=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.num_group = self.world_size // self.tensor_parallel_size
+        env.scatter_activation_1d = scatter_activation
 
     def init_dist_group(self):
         """Initialize 1D tensor parallel groups, and assign local_ranks and groups to each gpu.

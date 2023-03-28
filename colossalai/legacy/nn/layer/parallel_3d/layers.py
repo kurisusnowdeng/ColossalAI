@@ -34,7 +34,7 @@ from ._operation import (
     split_tensor_3d,
     vocab_parallel_classifier_3d,
 )
-from ._utils import get_depth_from_env, get_parallel_mode_from_env, register_async_grad_hook, swap_in_out_group
+from ._utils import get_depth_from_env, get_parallel_mode_from_env, is_async_enabled, swap_in_out_group
 
 
 @LAYERS.register_module
@@ -61,7 +61,7 @@ class LayerNorm3D(ParallelLayer):
         self.input_x_weight_parallel_mode = get_parallel_mode_from_env(INPUT_X_WEIGHT_3D)
         self.depth = get_depth_from_env()
         self.normalized_shape = normalized_shape
-        self.normalized_shape_per_partition = divide(normalized_shape, self.depth)
+        self.normalized_shape_per_partition = divide(normalized_shape, self.depth**3)
 
         self.weight = Parameter(
             torch.ones(self.normalized_shape_per_partition, device=get_current_device(), dtype=dtype))
@@ -70,21 +70,19 @@ class LayerNorm3D(ParallelLayer):
                 torch.zeros(self.normalized_shape_per_partition, device=get_current_device(), dtype=dtype))
         else:
             self.bias = None
-        self.variance_epsilon = eps
+        self.variance_epsilon = torch.tensor(eps, device=get_current_device())
         self.reset_parameters()
         self._set_tensor_parallel_attributes()
 
     def _set_tensor_parallel_attributes(self) -> None:
-        set_tensor_parallel_attribute_by_partition(self.weight, self.depth)
+        set_tensor_parallel_attribute_by_partition(self.weight, self.depth**3)
         if self.bias is not None:
-            set_tensor_parallel_attribute_by_partition(self.bias, self.depth)
+            set_tensor_parallel_attribute_by_partition(self.bias, self.depth**3)
 
     def reset_parameters(self) -> None:
         init.ones_()(self.weight)
-        register_async_grad_hook(self.weight)
         if self.bias is not None:
             init.zeros_()(self.bias)
-            register_async_grad_hook(self.bias)
 
     def _load_from_global_state_dict(self, state_dict, prefix, *args, **kwargs):
         local_state = OrderedDict()
@@ -195,16 +193,18 @@ class Linear3D(ParallelLayer):
         self.output_parallel_mode = get_parallel_mode_from_env(OUTPUT_GROUP_3D)
         self.output_x_weight_parallel_mode = get_parallel_mode_from_env(OUTPUT_X_WEIGHT_3D)
         self.depth = get_depth_from_env()
+        self.enable_async = is_async_enabled()
         self.skip_bias_add = skip_bias_add
         self.in_features_per_partition = divide(in_features, self.depth**2)
         self.out_features_per_partition = divide(out_features, self.depth)
-        self.bias_features_per_partition = divide(out_features, self.depth)
+        self.bias_features_per_partition = divide(out_features, self.depth**3)
 
         self.weight = Parameter(
             torch.empty(self.in_features_per_partition,
                         self.out_features_per_partition,
                         device=get_current_device(),
                         dtype=dtype))
+        setattr(self.weight, 'is_in_bucket', False)
         if bias:
             self.bias = Parameter(
                 torch.zeros(self.bias_features_per_partition, device=get_current_device(), dtype=dtype))
@@ -218,25 +218,16 @@ class Linear3D(ParallelLayer):
     def _set_tensor_parallel_attributes(self) -> None:
         set_tensor_parallel_attribute_by_partition(self.weight, self.depth**3)
         if self.bias is not None:
-            set_tensor_parallel_attribute_by_partition(self.bias, self.depth)
-
-    def _sync_grad_hook(self, grad) -> Tensor:
-        grad = all_reduce(grad.clone(), self.output_x_weight_parallel_mode)
-        return grad
+            set_tensor_parallel_attribute_by_partition(self.bias, self.depth**3)
 
     def reset_parameters(self, weight_initializer, bias_initializer) -> None:
         with seed(ParallelMode.TENSOR):
             fan_in, fan_out = self.in_features, self.out_features
 
             weight_initializer(self.weight, fan_in=fan_in, fan_out=fan_out)
-            register_async_grad_hook(self.weight)
 
             if self.bias is not None:
                 bias_initializer(self.bias, fan_in=fan_in)
-                broadcast(self.bias,
-                          gpc.get_ranks_in_group(self.output_x_weight_parallel_mode)[0],
-                          self.output_x_weight_parallel_mode)
-                self.bias.register_hook(self._sync_grad_hook)
 
     def _load_from_global_state_dict(self, state_dict, prefix, *args, **kwargs):
         local_state = OrderedDict()
@@ -265,7 +256,7 @@ class Linear3D(ParallelLayer):
                 },
                 partition_states={
                     weight_key: True,
-                    bias_key: False
+                    bias_key: True
                 },
             )
         # partition in input groups
@@ -292,7 +283,7 @@ class Linear3D(ParallelLayer):
             },
             partition_states={
                 weight_key: True,
-                bias_key: False
+                bias_key: True
             },
         )
 
@@ -315,7 +306,7 @@ class Linear3D(ParallelLayer):
             },
             partition_states={
                 weight_key: True,
-                bias_key: False
+                bias_key: True
             },
             keep_vars=keep_vars,
         )
@@ -346,7 +337,7 @@ class Linear3D(ParallelLayer):
                 },
                 partition_states={
                     weight_key: True,
-                    bias_key: False
+                    bias_key: True
                 },
                 keep_vars=keep_vars,
             )
@@ -355,20 +346,18 @@ class Linear3D(ParallelLayer):
             destination.update(local_state)
 
     def forward(self, input_: Tensor) -> Tensor:
-        output = linear_3d(
+        return linear_3d(
             input_,
             self.weight,
+            self.bias,
             self.input_parallel_mode,
             self.weight_parallel_mode,
             self.output_parallel_mode,
+            self.output_x_weight_parallel_mode,
+            self.training,
+            self.enable_async,
+            self.skip_bias_add,
         )
-
-        if not self.skip_bias_add:
-            if self.bias is not None:
-                output = output + self.bias
-            return output
-        else:
-            return output, self.bias
 
 
 @LAYERS.register_module
@@ -404,8 +393,10 @@ class Classifier3D(ParallelLayer):
         self.input_parallel_mode = get_parallel_mode_from_env(INPUT_GROUP_3D)
         self.weight_parallel_mode = get_parallel_mode_from_env(WEIGHT_GROUP_3D)
         self.output_parallel_mode = get_parallel_mode_from_env(OUTPUT_GROUP_3D)
+        self.input_x_weight_parallel_mode = get_parallel_mode_from_env(INPUT_X_WEIGHT_3D)
         self.depth = get_depth_from_env()
-        self.in_features_per_partition = divide(in_features, self.depth)
+        self.enable_async = is_async_enabled()
+        self.in_features_per_partition = divide(in_features, self.depth**3)
 
         if weight is not None:
             self.weight = weight
@@ -424,22 +415,16 @@ class Classifier3D(ParallelLayer):
 
     def _set_tensor_parallel_attributes(self) -> None:
         if self.has_weight:
-            set_tensor_parallel_attribute_by_partition(self.weight, self.depth)
+            set_tensor_parallel_attribute_by_partition(self.weight, self.depth**3)
 
     def reset_parameters(self, weight_initializer, bias_initializer) -> None:
+        fan_in, fan_out = self.in_features, self.num_classes
         with seed(ParallelMode.TENSOR):
-            fan_in, fan_out = self.in_features, self.num_classes
-
             if self.has_weight:
                 weight_initializer(self.weight, fan_in=fan_in, fan_out=fan_out)
-                broadcast(self.weight, gpc.get_ranks_in_group(self.weight_parallel_mode)[0], self.weight_parallel_mode)
 
-            register_async_grad_hook(self.weight)
-
-            if self.bias is not None:
-                bias_initializer(self.bias, fan_in=fan_in)
-                broadcast(self.bias, gpc.get_ranks_in_group(ParallelMode.TENSOR)[0], ParallelMode.TENSOR)
-                register_async_grad_hook(self.bias)
+        if self.bias is not None:
+            bias_initializer(self.bias, fan_in=fan_in)
 
     def _load_from_global_state_dict(self, state_dict, prefix, *args, **kwargs):
         local_state = OrderedDict()
@@ -516,6 +501,8 @@ class Classifier3D(ParallelLayer):
             self.input_parallel_mode,
             self.weight_parallel_mode,
             self.output_parallel_mode,
+            self.input_x_weight_parallel_mode,
+            self.enable_async,
         )
 
 
@@ -554,9 +541,10 @@ class VocabParallelClassifier3D(ParallelLayer):
         self.output_parallel_mode = get_parallel_mode_from_env(OUTPUT_GROUP_3D)
         self.output_x_weight_parallel_mode = get_parallel_mode_from_env(OUTPUT_X_WEIGHT_3D)
         self.depth = get_depth_from_env()
+        self.enable_async = is_async_enabled()
         self.in_features_per_partition = divide(in_features, self.depth)
         self.out_features_per_partition = divide(num_classes, self.depth**2)
-        self.bias_features_per_partition = divide(num_classes, self.depth)
+        self.bias_features_per_partition = divide(num_classes, self.depth**3)
 
         if weight is not None:
             self.weight = weight
@@ -583,7 +571,7 @@ class VocabParallelClassifier3D(ParallelLayer):
         if self.has_weight:
             set_tensor_parallel_attribute_by_partition(self.weight, self.depth**3)
         if self.bias is not None:
-            set_tensor_parallel_attribute_by_partition(self.bias, self.depth)
+            set_tensor_parallel_attribute_by_partition(self.bias, self.depth**3)
 
     def reset_parameters(self, weight_initializer, bias_initializer) -> None:
         with seed(ParallelMode.TENSOR):
@@ -592,14 +580,8 @@ class VocabParallelClassifier3D(ParallelLayer):
             if self.has_weight:
                 weight_initializer(self.weight, fan_in=fan_in, fan_out=fan_out)
 
-            register_async_grad_hook(self.weight)
-
             if self.bias is not None:
                 bias_initializer(self.bias, fan_in=fan_in)
-                broadcast(self.bias,
-                          gpc.get_ranks_in_group(self.output_x_weight_parallel_mode)[0],
-                          self.output_x_weight_parallel_mode)
-                register_async_grad_hook(self.bias)
 
     def _load_from_global_state_dict(self, state_dict, prefix, *args, **kwargs):
         local_state = OrderedDict()
@@ -725,6 +707,8 @@ class VocabParallelClassifier3D(ParallelLayer):
             self.input_parallel_mode,
             self.weight_parallel_mode,
             self.output_parallel_mode,
+            self.output_x_weight_parallel_mode,
+            self.enable_async,
         )
 
 
@@ -773,32 +757,30 @@ class PatchEmbedding3D(ParallelLayer):
         self.grid_size = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
         self.num_patches = self.grid_size[0] * self.grid_size[1]
         self.embed_size = embed_size
-        embed_size_per_partition = embed_size // self.depth
+        self.embed_size_per_partition = divide(embed_size, self.depth**3)
         self.flatten = flatten
 
         self.weight = nn.Parameter(
-            torch.empty((embed_size_per_partition, in_chans, *self.patch_size),
+            torch.empty((self.embed_size_per_partition, in_chans, *self.patch_size),
                         device=get_current_device(),
                         dtype=dtype))
-        self.bias = nn.Parameter(torch.empty(embed_size_per_partition, device=get_current_device(), dtype=dtype))
+        self.bias = nn.Parameter(torch.empty(self.embed_size_per_partition, device=get_current_device(), dtype=dtype))
 
         self.cls_token = nn.Parameter(
-            torch.zeros((1, 1, embed_size_per_partition), device=get_current_device(), dtype=dtype))
+            torch.zeros((1, 1, self.embed_size_per_partition), device=get_current_device(), dtype=dtype))
         self.pos_embed = nn.Parameter(
-            torch.zeros((1, self.num_patches + 1, embed_size_per_partition), device=get_current_device(), dtype=dtype))
+            torch.zeros((1, self.num_patches + 1, self.embed_size_per_partition),
+                        device=get_current_device(),
+                        dtype=dtype))
 
         self.reset_parameters(weight_initializer, bias_initializer, position_embed_initializer)
         self._set_tensor_parallel_attributes()
 
     def _set_tensor_parallel_attributes(self) -> None:
-        set_tensor_parallel_attribute_by_partition(self.weight, self.depth)
-        set_tensor_parallel_attribute_by_partition(self.bias, self.depth)
-        set_tensor_parallel_attribute_by_partition(self.cls_token, self.depth)
-        set_tensor_parallel_attribute_by_partition(self.pos_embed, self.depth)
-
-    def _sync_grad_hook(self, grad) -> Tensor:
-        grad = all_reduce(grad.clone(), self.input_x_weight_parallel_mode)
-        return grad
+        set_tensor_parallel_attribute_by_partition(self.weight, self.depth**3)
+        set_tensor_parallel_attribute_by_partition(self.bias, self.depth**3)
+        set_tensor_parallel_attribute_by_partition(self.cls_token, self.depth**3)
+        set_tensor_parallel_attribute_by_partition(self.pos_embed, self.depth**3)
 
     def reset_parameters(self, weight_initializer, bias_initializer, position_embed_initializer) -> None:
         with seed(ParallelMode.TENSOR):
@@ -807,16 +789,6 @@ class PatchEmbedding3D(ParallelLayer):
             weight_initializer(self.weight, fan_in=fan_in, fan_out=fan_out)
             bias_initializer(self.bias, fan_in=fan_in)
             position_embed_initializer(self.pos_embed)
-
-        src_rank = gpc.get_ranks_in_group(self.input_x_weight_parallel_mode)[0]
-        broadcast(self.weight, src_rank, self.input_x_weight_parallel_mode)
-        broadcast(self.bias, src_rank, self.input_x_weight_parallel_mode)
-        broadcast(self.pos_embed, src_rank, self.input_x_weight_parallel_mode)
-
-        self.weight.register_hook(self._sync_grad_hook)
-        self.bias.register_hook(self._sync_grad_hook)
-        self.cls_token.register_hook(self._sync_grad_hook)
-        self.pos_embed.register_hook(self._sync_grad_hook)
 
     def _load_from_global_state_dict(self, state_dict, prefix, *args, **kwargs):
         local_state = OrderedDict()
@@ -908,13 +880,18 @@ class PatchEmbedding3D(ParallelLayer):
         input_ = split_batch_3d(input_,
                                 input_parallel_mode=self.input_parallel_mode,
                                 weight_parallel_mode=self.weight_parallel_mode)
-        output = F.conv2d(input_, self.weight, self.bias, stride=self.patch_size)
+
+        weight = all_gather_tensor_3d(self.weight, 0, self.input_x_weight_parallel_mode)
+        bias = all_gather_tensor_3d(self.bias, -1, self.input_x_weight_parallel_mode)
+
+        output = F.conv2d(input_, weight, bias, stride=self.patch_size)
         if self.flatten:
             output = output.flatten(2).transpose(1, 2)    # BCHW -> BNC
 
-        cls_token = self.cls_token.expand(output.shape[0], -1, -1)
-        output = torch.cat((cls_token, output), dim=1)
-        output = output + self.pos_embed
+        cls_token = all_gather_tensor_3d(self.cls_token, -1,
+                                         self.input_x_weight_parallel_mode).expand(output.shape[0], -1, -1)
+        pos_embed = all_gather_tensor_3d(self.pos_embed, -1, self.input_x_weight_parallel_mode)
+        output = torch.cat((cls_token, output), dim=1) + pos_embed
 
         return output
 
@@ -967,7 +944,7 @@ class Embedding3D(ParallelLayer):
 
         self.num_embeddings = num_embeddings
         self.embed_dim = embedding_dim
-        embed_dim_per_partition = divide(embedding_dim, self.depth)
+        embed_dim_per_partition = divide(embedding_dim, self.depth**3)
         self.padding_idx = padding_idx
         self.embed_args = args
         self.embed_kwargs = kwargs
@@ -979,20 +956,13 @@ class Embedding3D(ParallelLayer):
         self._set_tensor_parallel_attributes()
 
     def _set_tensor_parallel_attributes(self) -> None:
-        set_tensor_parallel_attribute_by_partition(self.weight, self.depth)
-
-    def _sync_grad_hook(self, grad) -> Tensor:
-        grad = all_reduce(grad.clone(), self.input_x_weight_parallel_mode)
-        return grad
+        set_tensor_parallel_attribute_by_partition(self.weight, self.depth**3)
 
     def reset_parameters(self, weight_initializer) -> None:
         with seed(ParallelMode.TENSOR):
             fan_in, fan_out = self.num_embeddings, self.embed_dim
             weight_initializer(self.weight, fan_in=fan_in, fan_out=fan_out)
             self._fill_padding_idx_with_zero()
-        broadcast(self.weight,
-                  gpc.get_ranks_in_group(self.input_x_weight_parallel_mode)[0], self.input_x_weight_parallel_mode)
-        self.weight.register_hook(self._sync_grad_hook)
 
     def _fill_padding_idx_with_zero(self) -> None:
         if self.padding_idx is not None:
@@ -1046,7 +1016,8 @@ class Embedding3D(ParallelLayer):
         input_ = split_batch_3d(input_,
                                 input_parallel_mode=self.input_parallel_mode,
                                 weight_parallel_mode=self.weight_parallel_mode)
-        output = F.embedding(input_, self.weight, self.padding_idx, *self.embed_args, **self.embed_kwargs)
+        weight = all_gather_tensor_3d(self.weight, -1, self.input_x_weight_parallel_mode)
+        output = F.embedding(input_, weight, self.padding_idx, *self.embed_args, **self.embed_kwargs)
 
         return output
 

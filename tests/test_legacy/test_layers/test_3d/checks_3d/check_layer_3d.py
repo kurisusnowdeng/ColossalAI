@@ -56,6 +56,8 @@ def check_linear():
     bias_master = layer_master.bias.data
     torch.distributed.broadcast(bias_master, src=0)
     bias = torch.chunk(bias_master, DEPTH)[j]
+    bias = torch.chunk(bias, DEPTH)[k]
+    bias = torch.chunk(bias, DEPTH)[i]
     layer.bias.data.copy_(bias)
 
     A_shape = (BATCH_SIZE, SEQ_LENGTH, INPUT_SIZE)
@@ -109,6 +111,8 @@ def check_linear():
 
     bias_grad = layer_master.bias.grad
     bias_grad = torch.chunk(bias_grad, DEPTH)[j]
+    bias_grad = torch.chunk(bias_grad, DEPTH)[k]
+    bias_grad = torch.chunk(bias_grad, DEPTH)[i]
     logger.info('Rank {} linear backward (bias_grad): {}'.format(rank, check_equal(bias_grad, layer.bias.grad)))
 
     return fwd_end - fwd_start, bwd_end - bwd_start
@@ -136,10 +140,14 @@ def check_layernorm():
     weight_master = norm_master.weight.data
     torch.distributed.broadcast(weight_master, src=0)
     weight = torch.chunk(weight_master, DEPTH)[k]
+    weight = torch.chunk(weight, DEPTH)[j]
+    weight = torch.chunk(weight, DEPTH)[i]
     norm.weight.data.copy_(weight)
     bias_master = norm_master.bias.data
     torch.distributed.broadcast(bias_master, src=0)
     bias = torch.chunk(bias_master, DEPTH)[k]
+    bias = torch.chunk(bias, DEPTH)[j]
+    bias = torch.chunk(bias, DEPTH)[i]
     norm.bias.data.copy_(bias)
 
     A_shape = (BATCH_SIZE, SEQ_LENGTH, INPUT_SIZE)
@@ -187,12 +195,16 @@ def check_layernorm():
     A_grad = torch.chunk(A_grad, DEPTH, dim=0)[j]
     logger.info('Rank {} layernorm backward (input_grad): {}'.format(rank, check_equal(A_grad, A.grad)))
 
-    bias_grad = norm_master.weight.grad
-    bias_grad = torch.chunk(bias_grad, DEPTH)[k]
-    logger.info('Rank {} layernorm backward (weight_grad): {}'.format(rank, check_equal(bias_grad, norm.weight.grad)))
+    weight_grad = norm_master.weight.grad
+    weight_grad = torch.chunk(weight_grad, DEPTH)[k]
+    weight_grad = torch.chunk(weight_grad, DEPTH)[j]
+    weight_grad = torch.chunk(weight_grad, DEPTH)[i]
+    logger.info('Rank {} layernorm backward (weight_grad): {}'.format(rank, check_equal(weight_grad, norm.weight.grad)))
 
     bias_grad = norm_master.bias.grad
     bias_grad = torch.chunk(bias_grad, DEPTH)[k]
+    bias_grad = torch.chunk(bias_grad, DEPTH)[j]
+    bias_grad = torch.chunk(bias_grad, DEPTH)[i]
     logger.info('Rank {} layernorm backward (bias_grad): {}'.format(rank, check_equal(bias_grad, norm.bias.grad)))
 
     return fwd_end - fwd_start, bwd_end - bwd_start
@@ -203,6 +215,7 @@ def check_classifier_no_given_weight():
     logger = get_dist_logger()
     device = get_current_device()
     INPUT_SIZE = HIDDEN_SIZE
+    num_classes = 3
 
     input_parallel_mode = get_parallel_mode_from_env(INPUT_GROUP_3D)
     weight_parallel_mode = get_parallel_mode_from_env(WEIGHT_GROUP_3D)
@@ -212,15 +225,17 @@ def check_classifier_no_given_weight():
     i = global_context.get_local_rank(weight_parallel_mode)
     k = global_context.get_local_rank(output_parallel_mode)
 
-    layer = Classifier3D(INPUT_SIZE, NUM_CLASSES, bias=True)
+    layer = Classifier3D(INPUT_SIZE, num_classes, bias=True)
     layer = layer.to(device)
 
-    layer_master = VanillaClassifier(INPUT_SIZE, NUM_CLASSES, bias=True)
+    layer_master = VanillaClassifier(INPUT_SIZE, num_classes, bias=True)
     layer_master = layer_master.to(device)
 
     weight_master = layer_master.weight.data
     torch.distributed.broadcast(weight_master, src=0)
     weight = torch.chunk(weight_master, DEPTH, dim=-1)[k]
+    weight = torch.chunk(weight, DEPTH, dim=-1)[j]
+    weight = torch.chunk(weight, DEPTH, dim=-1)[i]
     layer.weight.data.copy_(weight)
     bias_master = layer_master.bias.data
     torch.distributed.broadcast(bias_master, src=0)
@@ -230,8 +245,8 @@ def check_classifier_no_given_weight():
     A_master = torch.randn(A_shape, device=device)
     torch.distributed.broadcast(A_master, src=0)
     A = torch.chunk(A_master, DEPTH, dim=0)[i]
-    A = torch.chunk(A, DEPTH, dim=-1)[k]
     A = torch.chunk(A, DEPTH, dim=0)[j]
+    A = torch.chunk(A, DEPTH, dim=-1)[k]
     A = A.clone()
     A.requires_grad = True
 
@@ -266,19 +281,17 @@ def check_classifier_no_given_weight():
     C_master.backward(grad_master)
     A_grad = A_master.grad
     A_grad = torch.chunk(A_grad, DEPTH, dim=0)[i]
-    A_grad = torch.chunk(A_grad, DEPTH, dim=-1)[k]
     A_grad = torch.chunk(A_grad, DEPTH, dim=0)[j]
+    A_grad = torch.chunk(A_grad, DEPTH, dim=-1)[k]
     logger.info('Rank {} classifier (no given weight) backward (input_grad): {}'.format(
         rank, check_equal(A_grad, A.grad)))
 
     B_grad = layer_master.weight.grad
     B_grad = torch.chunk(B_grad, DEPTH, dim=-1)[k]
-    if j == k:
-        logger.info('Rank {} classifier (no given weight) backward (weight_grad): {}'.format(
-            rank, check_equal(B_grad, layer.weight.grad)))
-    else:
-        logger.info('Rank {} classifier (no given weight) backward (weight_grad): {}'.format(
-            rank, layer.weight.grad is None))
+    B_grad = torch.chunk(B_grad, DEPTH, dim=-1)[j]
+    B_grad = torch.chunk(B_grad, DEPTH, dim=-1)[i]
+    logger.info('Rank {} classifier (no given weight) backward (weight_grad): {}'.format(
+        rank, check_equal(B_grad, layer.weight.grad)))
 
     bias_grad = layer_master.bias.grad
     logger.info('Rank {} classifier (no given weight) backward (bias_grad): {}'.format(
@@ -316,6 +329,8 @@ def check_vocab_parallel_classifier_no_given_weight():
     bias_master = layer_master.bias.data
     torch.distributed.broadcast(bias_master, src=0)
     bias = torch.chunk(bias_master, DEPTH)[j]
+    bias = torch.chunk(bias, DEPTH)[k]
+    bias = torch.chunk(bias, DEPTH)[i]
     layer.bias.data.copy_(bias)
 
     A_shape = (BATCH_SIZE, SEQ_LENGTH, INPUT_SIZE)
@@ -375,6 +390,8 @@ def check_vocab_parallel_classifier_no_given_weight():
 
     bias_grad = layer_master.bias.grad
     bias_grad = torch.chunk(bias_grad, DEPTH)[j]
+    bias_grad = torch.chunk(bias_grad, DEPTH)[k]
+    bias_grad = torch.chunk(bias_grad, DEPTH)[i]
     logger.info('Rank {} vocab parallel classifier (no given weight) backward (bias_grad): {}'.format(
         rank, check_equal(bias_grad, layer.bias.grad)))
 
@@ -565,10 +582,14 @@ def check_patch_embed():
     proj_weight_master = layer_master.weight.data
     torch.distributed.broadcast(proj_weight_master, src=0)
     proj_weight = torch.chunk(proj_weight_master, DEPTH, dim=0)[k]
+    proj_weight = torch.chunk(proj_weight, DEPTH, dim=0)[j]
+    proj_weight = torch.chunk(proj_weight, DEPTH, dim=0)[i]
     layer.weight.data.copy_(proj_weight)
     proj_bias_master = layer_master.bias.data
     torch.distributed.broadcast(proj_bias_master, src=0)
     proj_bias = torch.chunk(proj_bias_master, DEPTH)[k]
+    proj_bias = torch.chunk(proj_bias, DEPTH)[j]
+    proj_bias = torch.chunk(proj_bias, DEPTH)[i]
     layer.bias.data.copy_(proj_bias)
 
     A_shape = (BATCH_SIZE, 3, IMG_SIZE, IMG_SIZE)
@@ -610,20 +631,28 @@ def check_patch_embed():
 
     cls_grad_master = layer_master.cls_token.grad
     cls_grad = torch.chunk(cls_grad_master, DEPTH, dim=-1)[k]
+    cls_grad = torch.chunk(cls_grad, DEPTH, dim=-1)[j]
+    cls_grad = torch.chunk(cls_grad, DEPTH, dim=-1)[i]
     logger.info('Rank {} patch embed backward (cls_grad): {}'.format(rank, check_equal(cls_grad, layer.cls_token.grad)))
 
     pos_grad_master = layer_master.pos_embed.grad
     pos_grad = torch.chunk(pos_grad_master, DEPTH, dim=-1)[k]
+    pos_grad = torch.chunk(pos_grad, DEPTH, dim=-1)[j]
+    pos_grad = torch.chunk(pos_grad, DEPTH, dim=-1)[i]
     logger.info('Rank {} patch embed backward (pos_embed_grad): {}'.format(rank,
                                                                            check_equal(pos_grad, layer.pos_embed.grad)))
 
     B_grad = layer_master.weight.grad
     B_grad = torch.chunk(B_grad, DEPTH, dim=0)[k]
+    B_grad = torch.chunk(B_grad, DEPTH, dim=0)[j]
+    B_grad = torch.chunk(B_grad, DEPTH, dim=0)[i]
     logger.info('Rank {} patch embed backward (proj_weight_grad): {}'.format(rank,
                                                                              check_equal(B_grad, layer.weight.grad)))
 
     bias_grad = layer_master.bias.grad
     bias_grad = torch.chunk(bias_grad, DEPTH)[k]
+    bias_grad = torch.chunk(bias_grad, DEPTH)[j]
+    bias_grad = torch.chunk(bias_grad, DEPTH)[i]
     logger.info('Rank {} patch embed backward (proj_bias_grad): {}'.format(rank,
                                                                            check_equal(bias_grad, layer.bias.grad)))
 
@@ -652,6 +681,8 @@ def check_embed():
     weight_master = layer_master.weight.data
     torch.distributed.broadcast(weight_master, src=0)
     weight = torch.chunk(weight_master, DEPTH, dim=-1)[k]
+    weight = torch.chunk(weight, DEPTH, dim=-1)[j]
+    weight = torch.chunk(weight, DEPTH, dim=-1)[i]
     layer.weight.data.copy_(weight)
 
     A_shape = (BATCH_SIZE, SEQ_LENGTH)
@@ -692,6 +723,8 @@ def check_embed():
 
     B_grad = layer_master.weight.grad
     B_grad = torch.chunk(B_grad, DEPTH, dim=-1)[k]
+    B_grad = torch.chunk(B_grad, DEPTH, dim=-1)[j]
+    B_grad = torch.chunk(B_grad, DEPTH, dim=-1)[i]
     logger.info('Rank {} embed backward (weight_grad): {}'.format(rank, check_equal(B_grad, layer.weight.grad)))
 
     return fwd_end - fwd_start, bwd_end - bwd_start
@@ -732,9 +765,11 @@ def check_vocab_parallel_embed():
     out = layer(A)
     torch.cuda.synchronize()
     fwd_end = time.time()
-    logger.info('vocab parallel embed forward: pass | {0} --> {1} | {2:.3f} s'.format(
-        tuple(A.shape), tuple(out.shape), fwd_end - fwd_start),
-                ranks=[0])
+    logger.info(
+        'vocab parallel embed forward: pass | {0} --> {1} | {2:.3f} s'.format(tuple(A.shape), tuple(out.shape),
+                                                                              fwd_end - fwd_start),
+        ranks=[0],
+    )
 
     A_master = A_master.clone()
     C_master = layer_master(A_master)
@@ -851,9 +886,11 @@ def check_vocab_parallel_loss():
     fwd_start = time.time()
     loss = criterion(out, target_master)
     fwd_end = time.time()
-    logger.info('vocab parallel cross entropy loss forward: pass | {0} --> {1} | {2:.3f} s'.format(
-        tuple(out.shape), tuple(loss.shape), fwd_end - fwd_start),
-                ranks=[0])
+    logger.info(
+        'vocab parallel cross entropy loss forward: pass | {0} --> {1} | {2:.3f} s'.format(
+            tuple(out.shape), tuple(loss.shape), fwd_end - fwd_start),
+        ranks=[0],
+    )
 
     out_master = out_master.clone()
     out_master.requires_grad = True
