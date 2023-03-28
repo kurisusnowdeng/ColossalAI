@@ -8,22 +8,21 @@ from checks_1d.check_layer_1d import *
 from colossalai.core import global_context as gpc
 from colossalai.initialize import launch
 from colossalai.logging import disable_existing_loggers
-from colossalai.testing import rerun_if_address_is_in_use, spawn
-
-CONFIG = dict(parallel=dict(pipeline=dict(size=1), tensor=dict(size=4, mode='1d')),)
+from colossalai.testing import parameterize, rerun_if_address_is_in_use, spawn
 
 
-def check_layer(rank, world_size, port):
+def check_layer(rank, world_size, port, scatter):
     disable_existing_loggers()
+
+    CONFIG = dict(parallel=dict(pipeline=dict(size=1),
+                                tensor=dict(size=world_size, mode='1d', scatter_activation=scatter)),)
+
     launch(config=CONFIG, rank=rank, world_size=world_size, host='localhost', port=port, backend='nccl')
 
     check_linear_col()
     check_linear_row()
-    check_embed()
     check_vocab_parallel_embed()
-    check_classifier_no_given_weight()
     check_vocab_parallel_classifier_no_given_weight()
-    check_classifier_given_embed_weight()
     check_vocab_parallel_classifier_given_embed_weight()
     check_vocab_parallel_loss()
 
@@ -35,8 +34,9 @@ def check_layer(rank, world_size, port):
 
 @pytest.mark.dist
 @rerun_if_address_is_in_use()
-def test_1d():
-    spawn(check_layer, 4)
+@parameterize('scatter', [True, False])
+def test_1d(scatter: bool):
+    spawn(check_layer, 4, scatter=scatter)
 
 
 if __name__ == '__main__':

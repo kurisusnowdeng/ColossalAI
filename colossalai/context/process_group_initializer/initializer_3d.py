@@ -24,6 +24,18 @@ def _check_depth_env_var(depth):
         env.depth_3d = depth
 
 
+def _check_env_async_enabled(mode):
+    # check global variable
+    enable_async = env.async_3d
+
+    if enable_async:
+        assert enable_async == mode, \
+            '3D async mode has been set in the current environment and ' \
+            'does not match with the value passed to this initialized'
+    else:
+        env.async_3d = mode
+
+
 class Initializer_3D_Input(ProcessGroupInitializer):
     """3D tensor parallel initialization among input.
 
@@ -38,8 +50,8 @@ class Initializer_3D_Input(ProcessGroupInitializer):
         tensor_parallel_size (int): Size of tensor parallel.
     """
 
-    def __init__(self, num_group: int, depth: int, *args):
-        super().__init__(*args)
+    def __init__(self, num_group: int, depth: int, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.num_group = num_group
         self.depth = depth
 
@@ -89,8 +101,8 @@ class Initializer_3D_Weight(ProcessGroupInitializer):
         tensor_parallel_size (int): Size of tensor parallel.
     """
 
-    def __init__(self, num_group: int, depth: int, *args):
-        super().__init__(*args)
+    def __init__(self, num_group: int, depth: int, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.num_group = num_group
         self.depth = depth
 
@@ -140,8 +152,8 @@ class Initializer_3D_Output(ProcessGroupInitializer):
         tensor_parallel_size (int): Size of tensor parallel.
     """
 
-    def __init__(self, num_group: int, depth: int, *args):
-        super().__init__(*args)
+    def __init__(self, num_group: int, depth: int, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.num_group = num_group
         self.depth = depth
 
@@ -191,8 +203,8 @@ class Initializer_3D_InputxWeight(ProcessGroupInitializer):
         tensor_parallel_size (int): Size of tensor parallel.
     """
 
-    def __init__(self, num_group: int, depth: int, *args):
-        super().__init__(*args)
+    def __init__(self, num_group: int, depth: int, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.num_group = num_group
         self.depth = depth
 
@@ -245,8 +257,8 @@ class Initializer_3D_OutputxWeight(ProcessGroupInitializer):
         tensor_parallel_size (int): Size of tensor parallel.
     """
 
-    def __init__(self, num_group: int, depth: int, *args):
-        super().__init__(*args)
+    def __init__(self, num_group: int, depth: int, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.num_group = num_group
         self.depth = depth
 
@@ -298,19 +310,20 @@ class Initializer_3D(ProcessGroupInitializer):
         tensor_parallel_size (int): Size of tensor parallel.
     """
 
-    def __init__(self, *args):
-        super().__init__(*args)
+    def __init__(self, *args, enable_async=False, **kwargs):
+        super().__init__(*args, **kwargs)
         self.num_group = self.world_size // self.tensor_parallel_size
         self.depth = round(math.pow(self.tensor_parallel_size, 1 / 3))
         assert self.tensor_parallel_size == self.depth ** 3, \
             f'3D depth ({self.depth}) if not cube root of tensor parallel size ({self.tensor_parallel_size})'
         _check_depth_env_var(self.depth)
+        _check_env_async_enabled(enable_async)
 
-        self.input_initializer = Initializer_3D_Input(self.num_group, self.depth, *args)
-        self.weight_initializer = Initializer_3D_Weight(self.num_group, self.depth, *args)
-        self.output_initializer = Initializer_3D_Output(self.num_group, self.depth, *args)
-        self.input_x_weight_initializer = Initializer_3D_InputxWeight(self.num_group, self.depth, *args)
-        self.output_x_weight_initializer = Initializer_3D_OutputxWeight(self.num_group, self.depth, *args)
+        self.input_initializer = Initializer_3D_Input(self.num_group, self.depth, *args, **kwargs)
+        self.weight_initializer = Initializer_3D_Weight(self.num_group, self.depth, *args, **kwargs)
+        self.output_initializer = Initializer_3D_Output(self.num_group, self.depth, *args, **kwargs)
+        self.input_x_weight_initializer = Initializer_3D_InputxWeight(self.num_group, self.depth, *args, **kwargs)
+        self.output_x_weight_initializer = Initializer_3D_OutputxWeight(self.num_group, self.depth, *args, **kwargs)
 
     def init_dist_group(self):
         """Initialize 3D tensor parallel groups, and assign local_ranks and groups to each gpu.

@@ -21,6 +21,7 @@ from .common import BATCH_SIZE, DEPTH, HIDDEN_SIZE, NUM_CLASSES, SEQ_LENGTH, VOC
 
 
 def check_linear_col():
+    env.data_shape_1d = (BATCH_SIZE, SEQ_LENGTH)
     device = get_current_device()
     dtype = torch.float32
     INPUT_SIZE = HIDDEN_SIZE
@@ -34,6 +35,8 @@ def check_linear_col():
     A_master = torch.randn(A_shape, dtype=dtype, device=device)
     dist.broadcast(A_master, src=0)
     A = A_master.clone()
+    if env.scatter_activation_1d:
+        A = torch.chunk(A.view(-1, A.shape[-1]), DEPTH, 0)[i].detach()
     A.requires_grad = True
 
     W_shape = (OUTPUT_SIZE, INPUT_SIZE)
@@ -76,6 +79,8 @@ def check_linear_col():
     grad_master = grad_master.clone()
     C_master.backward(grad_master)
     A_grad = A_master.grad
+    if env.scatter_activation_1d:
+        A_grad = torch.chunk(A_grad.view(-1, A_grad.shape[-1]), DEPTH, 0)[i]
     check_equal(A_grad, A.grad)
 
     W_grad = W_master.grad
@@ -90,6 +95,7 @@ def check_linear_col():
 
 
 def check_linear_row():
+    env.data_shape_1d = (BATCH_SIZE, SEQ_LENGTH)
     device = get_current_device()
     dtype = torch.float32
     INPUT_SIZE = HIDDEN_SIZE
@@ -131,6 +137,8 @@ def check_linear_row():
     B_master.requires_grad = True
     C_master = torch.matmul(A_master, W_master.transpose(0, 1)) + B_master
     C = C_master.clone()
+    if env.scatter_activation_1d:
+        C = torch.chunk(C.view(-1, C.shape[-1]), DEPTH, 0)[i]
 
     check_equal(out, C)
     print_rank_0('linear_row forward: pass')
@@ -139,6 +147,8 @@ def check_linear_row():
     grad_master = torch.randn(grad_shape, dtype=dtype, device=get_current_device())
     dist.broadcast(grad_master, src=0)
     grad = grad_master.clone()
+    if env.scatter_activation_1d:
+        grad = torch.chunk(grad.view(-1, grad.shape[-1]), DEPTH, 0)[i]
     out.backward(grad)
 
     grad_master = grad_master.clone()
@@ -157,6 +167,7 @@ def check_linear_row():
     print_rank_0('linear_row backward: pass')
 
 
+# to be deprecated
 def check_embed():
     device = get_current_device()
     dtype = torch.float32
@@ -224,6 +235,8 @@ def check_vocab_parallel_embed():
     A_master = A_master.clone()
     C_master = embed_master(A_master)
     C = C_master.clone()
+    if env.scatter_activation_1d:
+        C = torch.chunk(C.view(-1, C.shape[-1]), DEPTH, 0)[i]
     check_equal(out, C)
     print_rank_0('vocab parallel embed forward: pass')
 
@@ -231,6 +244,8 @@ def check_vocab_parallel_embed():
     grad_master = torch.randn(grad_shape, dtype=dtype, device=device)
     torch.distributed.broadcast(grad_master, src=0)
     grad = grad_master.clone()
+    if env.scatter_activation_1d:
+        grad = torch.chunk(grad.view(-1, grad.shape[-1]), DEPTH, 0)[i]
     out.backward(grad)
     grad_master = grad_master.clone()
     C_master.backward(grad_master)
@@ -241,6 +256,7 @@ def check_vocab_parallel_embed():
     print_rank_0('vocab parallel embed backward: pass')
 
 
+# to be deprecated
 def check_classifier_no_given_weight():
     device = get_current_device()
     dtype = torch.float32
@@ -332,6 +348,8 @@ def check_vocab_parallel_classifier_no_given_weight():
     A_master = torch.randn(A_shape, dtype=dtype, device=device)
     dist.broadcast(A_master, src=0)
     A = A_master.clone()
+    if env.scatter_activation_1d:
+        A = torch.chunk(A.view(-1, A.shape[-1]), DEPTH, 0)[i].detach()
     A.requires_grad = True
 
     out = layer(A)
@@ -354,6 +372,8 @@ def check_vocab_parallel_classifier_no_given_weight():
     grad_master = grad_master.clone()
     C_master.backward(grad_master)
     A_grad = A_master.grad
+    if env.scatter_activation_1d:
+        A_grad = torch.chunk(A_grad.view(-1, A_grad.shape[-1]), DEPTH, 0)[i]
     check_equal(A_grad, A.grad)
 
     W_grad = layer_master.weight.grad
@@ -367,6 +387,7 @@ def check_vocab_parallel_classifier_no_given_weight():
     print_rank_0('vocab parallel classifier (no given weight) backward: pass')
 
 
+# to be deprecated
 def check_classifier_given_embed_weight():
     device = get_current_device()
     dtype = torch.float32
@@ -488,11 +509,11 @@ def check_vocab_parallel_loss():
     out = out.clone()
     out.requires_grad = True
 
-    loss = criterion(out, target_master)
+    loss = criterion(out.view(-1, out.shape[-1]), target_master.view(-1))
 
     out_master = out_master.clone()
     out_master.requires_grad = True
-    loss_master = criterion_master(out_master, target_master)
+    loss_master = criterion_master(out_master.view(-1, out_master.shape[-1]), target_master.view(-1))
     check_equal(loss, loss_master)
     print_rank_0('vocab parallel loss forward: pass')
 
@@ -547,6 +568,8 @@ def check_linear_row_stream_inference():
     B_master = B_master.clone()
     C_master = torch.matmul(A_master, W_master.transpose(0, 1)) + B_master
     C = C_master.clone()
+    if env.scatter_activation_1d:
+        C = torch.chunk(C.view(-1, C.shape[-1]), DEPTH, 0)[i]
 
     check_equal(out, C)
     print_rank_0('linear_row forward: pass')

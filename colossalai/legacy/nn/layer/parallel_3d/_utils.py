@@ -1,9 +1,10 @@
-from collections import OrderedDict
+from collections import deque
+from dataclasses import dataclass
 from functools import partial
 
-import torch
 from torch import Tensor
 
+from colossalai.communication import all_reduce, reduce_scatter
 from colossalai.constants import INPUT_GROUP_3D, INPUT_X_WEIGHT_3D, OUTPUT_GROUP_3D, OUTPUT_X_WEIGHT_3D, WEIGHT_GROUP_3D
 from colossalai.core import global_context as gpc
 from colossalai.global_variables import tensor_parallel_env as env
@@ -15,8 +16,18 @@ def get_depth_from_env() -> int:
         assert depth > 0, 'DEPTH must be greater than zero'
         return depth
 
-    except KeyError as e:
+    except KeyError:
         raise EnvironmentError('DEPTH is not found in the current environment, '
+                               'please make sure that you have used the correct process group initializer')
+
+
+def is_async_enabled() -> bool:
+    try:
+        enable_async = env.async_3d
+        return enable_async
+
+    except KeyError:
+        raise EnvironmentError('3D async mode is not found in the current environment, '
                                'please make sure that you have used the correct process group initializer')
 
 
@@ -42,58 +53,52 @@ def dbg_check_shape(tensor: Tensor, shape: tuple):
         '{} does not match {}'.format(tensor.shape, shape)
 
 
+@dataclass
+class AsyncOp:
+    tensor: Tensor = None
+    grad: Tensor = None
+    handle = None
+
+
 class AsyncGradientBucket(object):
 
     def __init__(self):
-        self.bucket = OrderedDict()
+        self.bucket = deque()
+        self.maxlen = len(self.bucket)
 
     def __len__(self):
         return len(self.bucket)
 
-    def push(self, async_op, grad_tensor, param_id):
-        self.bucket[param_id] = tuple((async_op, grad_tensor))
-        return torch.zeros_like(grad_tensor, dtype=grad_tensor.dtype, device=grad_tensor.device)
+    def clear(self):
+        while len(self.bucket) > 0:
+            op = self.bucket.pop()
+            op.tensor.is_in_bucket = False
+        self.maxlen = 0
 
-    def pop(self, param_id):
-        grad = None
-        if param_id in self.bucket:
-            op, grad = self.bucket.pop(param_id)
-            if op is not None:
-                op.wait()
-        return grad
+    def push(self, tensor):
+        tensor.is_in_bucket = True
+        self.bucket.append(AsyncOp(tensor=tensor))
+        self.maxlen = len(self.bucket)
 
-    def synchronize(self, params):
-        for p in params:
-            i = id(p)
-            if i in self.bucket:
-                op, grad = self.bucket.pop(i)
-                if op is not None:
-                    op.wait()
-                p.grad.add_(grad)
+    def async_reduce(self, grad, group, scatter=False, scattered_dim=0):
+        assert len(self.bucket) > 0
+        op = self.bucket[-1]
+        assert op.tensor is not None
+        fn = partial(reduce_scatter, dim=scattered_dim) if scatter else all_reduce
+        op.grad, op.handle = fn(tensor=grad, parallel_mode=group, async_op=True)
+        return None
 
-
-_async_grad_bucket = AsyncGradientBucket()
-
-
-def push_async_grad(op, grad, param_id):
-    return _async_grad_bucket.push(op, grad, param_id)
-
-
-def pop_async_grad(param_id):
-    return _async_grad_bucket.pop(param_id)
-
-
-def _async_grad_hook(grad, param_id):
-    grad.add_(pop_async_grad(param_id))
-    return grad
+    def wait(self):
+        assert len(self.bucket) > 0
+        op = self.bucket[-1]
+        if op.handle is not None:
+            op.handle.wait()
+            if op.tensor.grad is None:
+                op.tensor.grad = op.grad
+            else:
+                op.tensor.grad.add_(op.grad)
+            op.tensor.is_in_bucket = False
+            self.bucket.pop()
 
 
-def register_async_grad_hook(param):
-    param.register_hook(partial(_async_grad_hook, param_id=id(param)))
-
-
-def synchronize(params=list()):
-    _async_grad_bucket.synchronize(params)
-    torch.cuda.default_stream().synchronize()
-    if len(_async_grad_bucket) > 0:
-        raise RuntimeError(f"{len(_async_grad_bucket)} asynchronous gradient(s) not collected.")
+async_grad_bucket = AsyncGradientBucket()

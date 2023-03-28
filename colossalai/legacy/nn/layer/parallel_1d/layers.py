@@ -27,13 +27,14 @@ from colossalai.utils.cuda import get_current_device
 from ..base_layer import ParallelLayer
 from ..colossalai_layer._utils import ColossalaiModule
 from ..utils import divide, set_tensor_parallel_attribute_by_partition
-from ..vanilla import VanillaLayerNorm, VanillaPatchEmbedding
-from ._operation import linear_with_async_comm
+from ..vanilla import VanillaPatchEmbedding
+from ._operation import column_linear, row_linear
 from ._utils import (
-    gather_forward_split_backward,
+    all_gather_tensor,
     get_parallel_input,
     reduce_grad,
     reduce_input,
+    reduce_scatter_tensor,
     set_parallel_input,
     split_forward_gather_backward,
 )
@@ -72,12 +73,11 @@ class Linear1D(ColossalaiModule):
                  out_features: int,
                  bias: bool = True,
                  dtype: torch.dtype = None,
-                 gather_output: bool = False,
                  skip_bias_add: bool = False,
                  weight_initializer: Callable = init.kaiming_uniform_(a=math.sqrt(5)),
                  bias_initializer: Callable = init.xavier_uniform_(a=1, scale=1)):
         parallel_input = get_parallel_input()
-        if not parallel_input and not gather_output:
+        if not parallel_input:
             layer = Linear1D_Col(in_features,
                                  out_features,
                                  bias=bias,
@@ -90,7 +90,6 @@ class Linear1D(ColossalaiModule):
                                  out_features,
                                  bias=bias,
                                  dtype=dtype,
-                                 parallel_input=parallel_input,
                                  skip_bias_add=skip_bias_add,
                                  weight_initializer=weight_initializer,
                                  bias_initializer=bias_initializer)
@@ -185,7 +184,7 @@ class Classifier1D(ParallelLayer):
         self.parallel_input = get_parallel_input()
 
         # Divide the weight matrix along the last dimension.
-        self.input_size_per_partition = divide(in_features, gpc.tensor_parallel_size)
+        self.input_size = in_features
 
         # Parameters.
         # Initialize weight.
@@ -194,15 +193,13 @@ class Classifier1D(ParallelLayer):
             self.weight = weight
             self.has_weight = False
         else:
-            self.weight = Parameter(torch.empty(self.num_classes, self.input_size_per_partition, **factory_kwargs))
+            self.weight = Parameter(torch.empty(self.num_classes, self.input_size, **factory_kwargs))
             self.has_weight = True
         if bias:
             self.bias = Parameter(torch.empty(self.num_classes, **factory_kwargs))
         else:
             self.bias = None
-        with seed(ParallelMode.TENSOR):
-            self.reset_parameters(weight_initializer, bias_initializer)
-        self._set_tensor_parallel_attributes()
+        self.reset_parameters(weight_initializer, bias_initializer)
         set_parallel_input(False)
         env.vocab_parallel = False
 
@@ -212,12 +209,6 @@ class Classifier1D(ParallelLayer):
             weight_initializer(self.weight, fan_in=fan_in, fan_out=fan_out)
         if self.bias is not None:
             bias_initializer(self.bias, fan_in=fan_in)
-            broadcast(self.bias, gpc.get_ranks_in_group(ParallelMode.PARALLEL_1D)[0], ParallelMode.PARALLEL_1D)
-
-    def _set_tensor_parallel_attributes(self):
-        if self.has_weight:
-            num_partition = gpc.get_world_size(ParallelMode.TENSOR)
-            set_tensor_parallel_attribute_by_partition(self.weight, num_partition)
 
     def _load_from_global_state_dict(self, state_dict, prefix, *args):
         local_state = OrderedDict()
@@ -235,56 +226,25 @@ class Classifier1D(ParallelLayer):
                 if bias is not None:
                     local_state[bias_key] = bias
 
-        local_state = partition_tensor_parallel_state_dict(local_state,
-                                                           ParallelMode.PARALLEL_1D,
-                                                           dims={
-                                                               weight_key: -1,
-                                                               bias_key: 0
-                                                           },
-                                                           partition_states={
-                                                               weight_key: True,
-                                                               bias_key: False
-                                                           })
-        super()._load_from_global_state_dict(local_state, prefix, *args)
+        local_state = broadcast_state_dict(local_state, ParallelMode.PARALLEL_1D)
+        super()._load_from_state_dict(local_state, prefix, *args)
 
-    def _save_to_global_state_dict(self, destination, prefix, keep_vars):
-        weight_key = prefix + 'weight'
-        bias_key = prefix + 'bias'
-        local_state = OrderedDict()
-        if self.has_weight:
-            local_state[weight_key] = self.weight
-        if self.bias is not None:
-            local_state[bias_key] = self.bias
-        local_state = gather_tensor_parallel_state_dict(local_state,
-                                                        ParallelMode.PARALLEL_1D,
-                                                        dims={
-                                                            weight_key: -1,
-                                                            bias_key: 0
-                                                        },
-                                                        partition_states={
-                                                            weight_key: True,
-                                                            bias_key: False
-                                                        },
-                                                        keep_vars=keep_vars)
-        destination.update(local_state)
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        if gpc.get_local_rank(ParallelMode.TENSOR) == 0:
+            super()._save_to_state_dict(destination, prefix, keep_vars)
 
     def forward(self, input_: Tensor) -> Tensor:
-        # Set up backprop all-reduce.
         if self.parallel_input:
-            assert input_.shape[-1] == self.weight.shape[-1], \
-                'Invalid shapes in Classifier1D forward: input={}, weight={}. Expected last dim of input {}.'.format(
-                input_.shape, self.weight.shape, self.weight.shape[-1])
-            input_ = input_
+            input_parallel = all_gather_tensor(input_, -1, ParallelMode.PARALLEL_1D)
+        elif self.scatter_activation_1d:
+            input_parallel = all_gather_tensor(input_, 0, ParallelMode.PARALLEL_1D)
+            input_parallel = input_parallel.reshape(*env.data_shape_1d, -1)
         else:
-            assert divide(input_.shape[-1], gpc.tensor_parallel_size) == self.weight.shape[-1], \
-                'Invalid shapes in Classifier1D forward: input={}, weight={}. Expected last dim of input {}.'.format(
-                input_.shape, self.weight.shape, self.weight.shape[-1] * gpc.tensor_parallel_size)
-            input_ = split_forward_gather_backward(input_, ParallelMode.PARALLEL_1D, dim=-1)
+            input_parallel = reduce_grad(input_, ParallelMode.PARALLEL_1D)
 
-        output_parallel = F.linear(input_, self.weight)
-        output = reduce_input(output_parallel, ParallelMode.PARALLEL_1D)
-        if self.bias is not None:
-            output = output + self.bias
+        # Matrix multiply.
+        output = F.linear(input_parallel, self.weight, self.bias)
+
         return output
 
 
@@ -313,14 +273,13 @@ class VocabParallelClassifier1D(ParallelLayer):
                  weight: Parameter = None,
                  bias: bool = True,
                  dtype: torch.dtype = None,
-                 gather_output: bool = False,
                  weight_initializer: Callable = init.kaiming_uniform_(a=math.sqrt(5)),
                  bias_initializer: Callable = init.xavier_uniform_(a=1, scale=1)):
         super().__init__()
         self.in_features = in_features
         self.num_classes = num_classes
-        self.gather_output = gather_output
         self.parallel_input = get_parallel_input()
+        self.scatter_activation = env.scatter_activation_1d
 
         # Divide the weight matrix along the last dimension.
         self.num_classes_per_partition = divide(num_classes, gpc.tensor_parallel_size)
@@ -408,18 +367,17 @@ class VocabParallelClassifier1D(ParallelLayer):
         destination.update(local_state)
 
     def forward(self, input_: Tensor) -> Tensor:
-        assert input_.shape[-1] == self.weight.shape[-1], \
-            'Invalid shapes in VocabParallelClassifier1D forward: input={}, weight={}. Expected last dim of input {}.'.format(
-                input_.shape, self.weight.shape, self.weight.shape[-1])
-        # Set up backprop all-reduce.
-        input_parallel = reduce_grad(input_, ParallelMode.PARALLEL_1D)
-        # Matrix multiply.
-        output_parallel = F.linear(input_parallel, self.weight, self.bias)
-        if self.gather_output:
-            # All-gather across the partitions.
-            output = gather_forward_split_backward(output_parallel, ParallelMode.PARALLEL_1D, dim=-1)
+        if self.parallel_input:
+            input_parallel = all_gather_tensor(input_, -1, ParallelMode.PARALLEL_1D)
+        elif self.scatter_activation:
+            input_parallel = all_gather_tensor(input_, 0, ParallelMode.PARALLEL_1D)
+            input_parallel = input_parallel.reshape(*env.data_shape_1d, -1)
         else:
-            output = output_parallel
+            input_parallel = reduce_grad(input_, ParallelMode.PARALLEL_1D)
+
+        # Matrix multiply.
+        output = F.linear(input_parallel, self.weight, self.bias)
+
         return output
 
 
@@ -454,7 +412,6 @@ class Linear1D_Col(ParallelLayer):
                  out_features: int,
                  bias: bool = True,
                  dtype: torch.dtype = None,
-                 gather_output: bool = False,
                  skip_bias_add: bool = False,
                  weight_initializer: Callable = init.kaiming_uniform_(a=math.sqrt(5)),
                  bias_initializer: Callable = init.xavier_uniform_(a=1, scale=1)):
@@ -463,8 +420,8 @@ class Linear1D_Col(ParallelLayer):
         # Keep input parameters
         self.in_features = in_features
         self.out_features = out_features
-        self.gather_output = gather_output
         self.skip_bias_add = skip_bias_add
+        self.scatter_activation = env.scatter_activation_1d
 
         if skip_bias_add and not bias:
             raise ValueError('cannot skip bias addition if bias is None')
@@ -483,8 +440,7 @@ class Linear1D_Col(ParallelLayer):
         with seed(ParallelMode.TENSOR):
             self.reset_parameters(weight_initializer, bias_initializer)
         self._set_tensor_parallel_attributes()
-        is_parallel_output = not self.gather_output
-        set_parallel_input(is_parallel_output)
+        set_parallel_input(True)
 
     def reset_parameters(self, weight_initializer, bias_initializer) -> None:
         fan_in, fan_out = self.in_features, self.out_features
@@ -548,18 +504,16 @@ class Linear1D_Col(ParallelLayer):
         assert input_.shape[-1] == self.weight.shape[-1], \
             'Invalid shapes in Linear1D_Col forward: input={}, weight={}. Expected last dim of input {}.'.format(
                 input_.shape, self.weight.shape, self.weight.shape[-1])
-        # Set up backprop all-reduce.
-        # input_parallel = reduce_grad(input_, ParallelMode.PARALLEL_1D)
-        input_parallel = input_
         # Matrix multiply.
         bias = self.bias if not self.skip_bias_add else None
-        # output_parallel = F.linear(input_parallel, self.weight, bias)
-        output_parallel = linear_with_async_comm(input_parallel, self.weight, bias, ParallelMode.PARALLEL_1D, True)
-        if self.gather_output:
-            # All-gather across the partitions.
-            output = gather_forward_split_backward(output_parallel, ParallelMode.PARALLEL_1D, dim=-1)
-        else:
-            output = output_parallel
+        output = column_linear(
+            input_,
+            self.weight,
+            bias,
+            ParallelMode.PARALLEL_1D,
+            self.scatter_activation,
+            env.data_shape_1d,
+        )
 
         if self.skip_bias_add:
             return output, self.bias
@@ -593,7 +547,6 @@ class Linear1D_Row(ParallelLayer):
                  out_features: int,
                  bias: bool = True,
                  dtype: torch.dtype = None,
-                 parallel_input: bool = True,
                  skip_bias_add: bool = False,
                  weight_initializer: Callable = init.kaiming_uniform_(a=math.sqrt(5)),
                  bias_initializer: Callable = init.xavier_uniform_(a=1, scale=1),
@@ -605,8 +558,8 @@ class Linear1D_Row(ParallelLayer):
         # Keep input parameters
         self.in_features = in_features
         self.out_features = out_features
-        self.parallel_input = parallel_input
         self.skip_bias_add = skip_bias_add
+        self.scatter_activation = env.scatter_activation_1d
 
         if skip_bias_add and not bias:
             raise ValueError('cannot skip bias addition if bias is None')
@@ -692,48 +645,26 @@ class Linear1D_Row(ParallelLayer):
         destination.update(local_state)
 
     def forward(self, input_: Tensor) -> Tensor:
-        # Set up backprop all-reduce.
-        if self.parallel_input:
-            assert input_.shape[-1] == self.weight.shape[-1], \
-                'Invalid shapes in Linear1D_Row forward: input={}, weight={}. Expected last dim of input {}.'.format(
-                input_.shape, self.weight.shape, self.weight.shape[-1])
-            input_ = input_
-        else:
-            assert divide(input_.shape[-1], gpc.tensor_parallel_size) == self.weight.shape[-1], \
-                'Invalid shapes in Linear1D_Row forward: input={}, weight={}. Expected last dim of input {}.'.format(
-                input_.shape, self.weight.shape, self.weight.shape[-1] * gpc.tensor_parallel_size)
-            input_ = split_forward_gather_backward(input_, ParallelMode.PARALLEL_1D, dim=-1)
+        bias = self.bias if not self.skip_bias_add else None
+        stream_chunk_num = 1 if self.training else self.stream_chunk_num
+        output = row_linear(
+            input_,
+            self.weight_list if stream_chunk_num > 1 else self.weight,
+            bias,
+            ParallelMode.PARALLEL_1D,
+            self.scatter_activation,
+            env.data_shape_1d,
+            stream_chunk_num,
+        )
 
-        if self.stream_chunk_num > 1:
-            if self.training:
-                raise RuntimeError("use stream_chunk_num=1 in Linear1D_Row for training!")
-            with torch.no_grad():
-                output_parallel_list = [None for i in range(self.stream_chunk_num)]
-                handle_list = []
-                for i in range(self.stream_chunk_num):
-                    output_parallel_list[i] = F.linear(input_, self.weight_list[i])
-                    handle = torch.distributed.all_reduce(output_parallel_list[i],
-                                                          group=gpc.get_group(ParallelMode.PARALLEL_1D),
-                                                          async_op=True)
-                    handle_list.append(handle)
-                    # output_parallel_list[i] = reduce_input(output_parallel_list[i], ParallelMode.PARALLEL_1D)
-                for handle in handle_list:
-                    handle.wait()
-                output = torch.cat(output_parallel_list, dim=-1)
-        else:
-            output_parallel = F.linear(input_, self.weight)
-            # output_parallel = linear_with_async_comm(input_, self.weight, None, ParallelMode.PARALLEL_1D, False)
-            output = reduce_input(output_parallel, ParallelMode.PARALLEL_1D)
-        if not self.skip_bias_add:
-            if self.bias is not None:
-                output = output + self.bias
-            return output
-        else:
+        if self.skip_bias_add:
             return output, self.bias
+        else:
+            return output
 
 
 @LAYERS.register_module
-class Embedding1D(ParallelLayer):
+class Embedding1D(ColossalaiModule):
     r"""Embedding for 1D parallelism.
 
     Args:
@@ -771,36 +702,24 @@ class Embedding1D(ParallelLayer):
                  weight_initializer: Callable = init.normal_(),
                  *args,
                  **kwargs):
-        super().__init__()
+        embed = torch.nn.Embedding(num_embeddings=num_embeddings,
+                                   embedding_dim=embedding_dim,
+                                   padding_idx=padding_idx,
+                                   dtype=dtype,
+                                   *args,
+                                   **kwargs)
 
-        self.num_embeddings = num_embeddings
-        self.embed_dim = embedding_dim
-        embed_dim_per_partition = divide(embedding_dim, gpc.tensor_parallel_size)
+        super().__init__(embed)
 
-        self.padding_idx = padding_idx
-        self.embed_args = args
-        self.embed_kwargs = kwargs
-
-        self.weight = Parameter(
-            torch.empty((num_embeddings, embed_dim_per_partition), device=get_current_device(), dtype=dtype))
+        self.scatter_activation = env.scatter_activation_1d
 
         self.reset_parameters(weight_initializer)
-        self._set_tensor_parallel_attributes()
         set_parallel_input(False)
 
-    def _set_tensor_parallel_attributes(self):
-        set_tensor_parallel_attribute_by_partition(self.weight, gpc.tensor_parallel_size)
-
     def reset_parameters(self, weight_initializer) -> None:
-        with seed(ParallelMode.TENSOR):
-            fan_in, fan_out = self.num_embeddings, self.embed_dim
-            weight_initializer(self.weight, fan_in=fan_in, fan_out=fan_out)
-            self._fill_padding_idx_with_zero()
-
-    def _fill_padding_idx_with_zero(self) -> None:
-        if self.padding_idx is not None:
-            with torch.no_grad():
-                self.weight[self.padding_idx].fill_(0)
+        fan_in, fan_out = self.num_embeddings, self.embedding_dim
+        weight_initializer(self.weight, fan_in=fan_in, fan_out=fan_out)
+        self.module._fill_padding_idx_with_zero()
 
     def _load_from_global_state_dict(self, state_dict, prefix, *args):
         local_state = OrderedDict()
@@ -811,27 +730,21 @@ class Embedding1D(ParallelLayer):
             if weight is not None:
                 local_state[weight_key] = weight
 
-        local_state = partition_tensor_parallel_state_dict(local_state,
-                                                           ParallelMode.PARALLEL_1D,
-                                                           dims={weight_key: -1},
-                                                           partition_states={weight_key: True})
-        super()._load_from_global_state_dict(local_state, prefix, *args)
+        local_state = broadcast_state_dict(local_state, ParallelMode.PARALLEL_1D)
+        super()._load_from_state_dict(local_state, prefix, *args)
 
-    def _save_to_global_state_dict(self, destination, prefix, keep_vars):
-        weight_key = prefix + 'weight'
-        local_state = OrderedDict({weight_key: self.weight})
-        local_state = gather_tensor_parallel_state_dict(local_state,
-                                                        ParallelMode.PARALLEL_1D,
-                                                        dims={weight_key: -1},
-                                                        partition_states={weight_key: True},
-                                                        keep_vars=keep_vars)
-        destination.update(local_state)
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        if gpc.get_local_rank(ParallelMode.TENSOR) == 0:
+            super()._save_to_state_dict(destination, prefix, keep_vars)
 
     def forward(self, input_: Tensor) -> Tensor:
+        env.data_shape_1d = tuple(input_.shape)
 
-        output_parallel = F.embedding(input_, self.weight, self.padding_idx, *self.embed_args, **self.embed_kwargs)
+        output = self.module(input_)
 
-        output = gather_forward_split_backward(output_parallel, ParallelMode.PARALLEL_1D, dim=-1)
+        if self.scatter_activation:
+            output = output.reshape(-1, output.shape[-1])
+            output = split_forward_gather_backward(output, ParallelMode.PARALLEL_1D, 0)
 
         return output
 
@@ -881,11 +794,12 @@ class VocabParallelEmbedding1D(ParallelLayer):
         self.padding_idx = padding_idx
         self.embed_args = args
         self.embed_kwargs = kwargs
+        self.scatter_activation = env.scatter_activation_1d
 
-        tensor_parallel_size = gpc.get_world_size(ParallelMode.PARALLEL_1D)
-        tensor_parallel_rank = gpc.get_local_rank(ParallelMode.PARALLEL_1D)
-        self.num_embeddings_per_partition = divide(num_embeddings, tensor_parallel_size)
-        self.vocab_start_index = tensor_parallel_rank * self.num_embeddings_per_partition
+        self.tensor_parallel_size = gpc.get_world_size(ParallelMode.PARALLEL_1D)
+        self.tensor_parallel_rank = gpc.get_local_rank(ParallelMode.PARALLEL_1D)
+        self.num_embeddings_per_partition = divide(num_embeddings, self.tensor_parallel_size)
+        self.vocab_start_index = self.tensor_parallel_rank * self.num_embeddings_per_partition
         self.vocab_end_index = self.vocab_start_index + self.num_embeddings_per_partition
 
         self.weight = Parameter(
@@ -937,6 +851,7 @@ class VocabParallelEmbedding1D(ParallelLayer):
         destination.update(local_state)
 
     def forward(self, input_: Tensor) -> Tensor:
+        env.data_shape_1d = tuple(input_.shape)
         # Build the mask.
         input_mask = (input_ < self.vocab_start_index) | (input_ >= self.vocab_end_index)
         # Mask the input.
@@ -949,7 +864,12 @@ class VocabParallelEmbedding1D(ParallelLayer):
         # Mask the output embedding.
         output_parallel[input_mask, :] = 0.
         # Reduce across all the model parallel GPUs.
-        output = reduce_input(output_parallel, ParallelMode.PARALLEL_1D)
+        if self.scatter_activation:
+            output_parallel = output_parallel.reshape(-1, output_parallel.shape[-1])
+            output = reduce_scatter_tensor(output_parallel, 0, ParallelMode.PARALLEL_1D)
+        else:
+            output = reduce_input(output_parallel, ParallelMode.PARALLEL_1D)
+
         return output
 
 

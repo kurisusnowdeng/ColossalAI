@@ -4,6 +4,7 @@
 import torch
 import torch.distributed as dist
 
+from colossalai.communication import all_gather, reduce_scatter
 from colossalai.core import global_context as gpc
 from colossalai.global_variables import tensor_parallel_env as env
 
@@ -169,6 +170,70 @@ class _GatherForwardSplitBackward(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         return _split(grad_output, ctx.mode, ctx.dim), None, None
+
+
+class _AllGatherTensor(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, input_, dim, parallel_mode):
+        ctx.dim = dim
+        ctx.parallel_mode = parallel_mode
+        output = all_gather(input_, dim, parallel_mode)
+        return output
+
+    @staticmethod
+    def backward(ctx, output_grad):
+        input_grad = reduce_scatter(output_grad, ctx.dim, ctx.parallel_mode)
+        return input_grad, None, None
+
+
+def all_gather_tensor(tensor, dim, parallel_mode):
+    r"""All-reduce the gradient in backward pass.
+
+    Args:
+        tensor (:class:`torch.tensor`): Input tensor.
+        dim (int): Dimension to gather.
+        parallel_mode (:class:`colossalai.context.parallel_mode.ParallelMode`): Parallel mode.
+
+    Note:
+        The parallel_mode should be concluded in ``ParallelMode``. More details about ``ParallelMode`` could be found
+        in `parallel_mode <https://github.com/hpcaitech/ColossalAI/blob/main/colossalai/context/parallel_mode.py>`_.
+    """
+    return _AllGatherTensor.apply(tensor, dim, parallel_mode)
+
+
+class _ReduceScatterTensor(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, input_, dim, parallel_mode):
+        ctx.dim = dim
+        ctx.parallel_mode = parallel_mode
+        return reduce_scatter(input_, dim, parallel_mode)
+
+    @staticmethod
+    def backward(ctx, output_grad):
+        input_grad = all_gather(output_grad, ctx.dim, ctx.parallel_mode)
+        return input_grad, None, None
+
+
+def reduce_scatter_tensor(tensor, dim, parallel_mode):
+    r"""Reduce-scatter the input.
+
+    Args:
+        tensor (:class:`torch.tensor`): Input tensor.
+        dim (int): Dimension to scatter.
+        parallel_mode (:class:`colossalai.context.parallel_mode.ParallelMode`): Parallel mode.
+
+    Note:
+        The parallel_mode should be concluded in ``ParallelMode``. More details about ``ParallelMode`` could be found
+        in `parallel_mode <https://github.com/hpcaitech/ColossalAI/blob/main/colossalai/context/parallel_mode.py>`_
+    """
+    dim_size = tensor.size(dim)
+    world_size = gpc.get_world_size(parallel_mode)
+    assert dim_size % world_size == 0, \
+        f'The batch size ({dim_size}) is not a multiple of square of 3D depth ({world_size}).'
+
+    return _ReduceScatterTensor.apply(tensor, dim, parallel_mode)
 
 
 def reduce_grad(input_, parallel_mode):
