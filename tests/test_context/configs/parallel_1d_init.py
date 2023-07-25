@@ -4,5 +4,5 @@
 parallel = dict(
     zero=dict(size=2),
     pipeline=dict(size=2),
-    tensor=dict(size=8, mode='3d'),
+    tensor=dict(size=2, mode='1d'),
 )

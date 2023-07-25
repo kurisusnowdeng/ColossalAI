@@ -265,9 +265,7 @@ class Initializer_2p5D(ProcessGroupInitializer):
         depth (int): The depth of 2.5d parallel.
     """
 
-    def __init__(self, rank: int, world_size: int, config: Config, data_parallel_size: int, pipeline_parallel_size: int,
-                 tensor_parallel_size: int, depth: int):
-        args = (rank, world_size, config, data_parallel_size, pipeline_parallel_size, tensor_parallel_size)
+    def __init__(self, *args, depth: int = 1):
         super().__init__(*args)
         self.num_group = self.world_size // self.tensor_parallel_size
         self.tesseract_dim = int(math.sqrt(self.tensor_parallel_size / depth))

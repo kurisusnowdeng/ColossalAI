@@ -24,6 +24,7 @@ class Initializer_Pipeline(ProcessGroupInitializer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.data_parallel_size = self.ddp_size * self.zero_parallel_size
         self.data_group_size = self.world_size // self.data_parallel_size
         self.pipeline_stage_size = self.data_group_size // self.pipeline_parallel_size
 

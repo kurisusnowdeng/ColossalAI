@@ -47,6 +47,9 @@ class ParallelContext(metaclass=SingletonMeta):
         # default 3D parallel args, will be overwritten during process group initialization
         self.world_size = 1
         self.data_parallel_size = 1
+        self.distributed_data_parallel_size = 1
+        self.zero_parallel_size = 1
+        self.model_parallel_size = 1
         self.pipeline_parallel_size = 1
         self.tensor_parallel_size = 1
         self.num_processes_on_current_node = -1
@@ -394,14 +397,16 @@ class ParallelContext(metaclass=SingletonMeta):
             AssertionError: Raises an AssertionError if the world size does not equal to the product
                 of data parallel size, pipeline parallel size and tensor parallel size.
         """
-        dps = self.data_parallel_size
+        ddps = self.distributed_data_parallel_size
+        zps = self.zero_parallel_size
         pps = self.pipeline_parallel_size
         tps = self.tensor_parallel_size
         ws = self.world_size
-        assert ws == dps * pps * \
-            tps, f"Expected the world size {ws} to be equal to data" \
-                 f" parallel size ({dps}) * pipeline parallel size " \
-                 f"({pps}) * tensor parallel size ({tps})"
+        assert ws == ddps * zps * pps * tps, \
+            f"Expected the world size {ws} to be equal to distributed" \
+            f"data parallel size ({ddps}) * zero data parallel size "\
+            f"({zps}) * pipeline parallel size " \
+            f"({pps}) * tensor parallel size ({tps})"
 
     def _set_parallel_size_from_config(self, config: dict, key: str, attr_name: str):
         if key in config:
@@ -429,12 +434,16 @@ class ParallelContext(metaclass=SingletonMeta):
         # set parallel size as attributes for global context
         parallel_config = self.config.get('parallel', None)
         if parallel_config is not None:
+            self._set_parallel_size_from_config(parallel_config, 'zero', 'zero_parallel_size')
             self._set_parallel_size_from_config(parallel_config, 'pipeline', 'pipeline_parallel_size')
             self._set_parallel_size_from_config(parallel_config, 'tensor', 'tensor_parallel_size')
 
         # the user should not set the data parallel size manually
         # instead, it should be calculated based on other parallel config
-        self.data_parallel_size = self.world_size // (self.pipeline_parallel_size * self.tensor_parallel_size)
+        self.distributed_data_parallel_size = self.world_size // (
+            self.zero_parallel_size * self.pipeline_parallel_size * self.tensor_parallel_size)
+        self.data_parallel_size = self.distributed_data_parallel_size * self.zero_parallel_size
+        self.model_parallel_size = self.pipeline_parallel_size * self.tensor_parallel_size
 
         # get the tensor parallel mode and check
         tensor_parallel_mode = None
@@ -450,6 +459,9 @@ class ParallelContext(metaclass=SingletonMeta):
         pg_init = []
         # LSG: init data parallel process group for compatibility with other parallel module such as zero
         pg_init.append(dict(type=INITIALIZER_MAPPING['data']))
+        pg_init.append(dict(type=INITIALIZER_MAPPING['ddp']))
+        if self.zero_parallel_size > 1:
+            pg_init.append(dict(type=INITIALIZER_MAPPING['zero']))
 
         # LSG: init model parallel process group for compatibility with amp and clip grad
         pg_init.append(dict(type=INITIALIZER_MAPPING['model']))
@@ -474,9 +486,11 @@ class ParallelContext(metaclass=SingletonMeta):
             cfg = initializer_cfg.copy()
             initializer_type = cfg.pop('type')
             initializer = DIST_GROUP_INITIALIZER.get_module(initializer_type)(rank, world_size, self.config,
-                                                                              self.data_parallel_size,
+                                                                              self.distributed_data_parallel_size,
+                                                                              self.zero_parallel_size,
                                                                               self.pipeline_parallel_size,
                                                                               self.tensor_parallel_size, **cfg)
+
             parallel_setting = initializer.init_dist_group()
             if isinstance(parallel_setting, list):
                 for args in parallel_setting:

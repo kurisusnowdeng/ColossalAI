@@ -11,8 +11,10 @@ class ParallelMode(Enum):
 
     GLOBAL = 'global'
 
-    # common parallel
+    # data parallel
     DATA = 'data'
+    DDP = 'ddp'
+    ZERO = 'zero'
 
     # model parallel - containing tensor and pipeline parallel groups
     # this is added to facilitate amp and grad clipping in hybrid parallel

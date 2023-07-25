@@ -30,6 +30,37 @@ def check_data_parallel_rank(rank):
             assert dp_local_rank == group_idx
 
 
+def check_ddp_rank(rank):
+    global_world_size = gpc.get_world_size(ParallelMode.GLOBAL)
+    zero_size = gpc.get_world_size(ParallelMode.ZERO)
+    mp_size = gpc.get_world_size(ParallelMode.MODEL)
+    ddp_group_size = zero_size * mp_size
+    num_ddp_groups = global_world_size // ddp_group_size
+    ddp_local_rank = gpc.get_local_rank(ParallelMode.DDP)
+
+    assert gpc.get_world_size(ParallelMode.DDP) == num_ddp_groups
+
+    for group_idx in range(num_ddp_groups):
+        ranks_in_dp_group = range(group_idx * ddp_group_size, (group_idx + 1) * ddp_group_size)
+        if rank in ranks_in_dp_group:
+            assert ddp_local_rank == group_idx
+
+
+def check_zero_parallel_rank(rank):
+    global_world_size = gpc.get_world_size(ParallelMode.GLOBAL)
+    ddp_size = gpc.get_world_size(ParallelMode.DDP)
+    mp_size = gpc.get_world_size(ParallelMode.MODEL)
+    num_zero_groups = global_world_size // (ddp_size * mp_size)
+    zero_local_rank = gpc.get_local_rank(ParallelMode.ZERO)
+
+    assert gpc.get_world_size(ParallelMode.ZERO) == num_zero_groups
+
+    for zero_idx in range(num_zero_groups):
+        ranks_in_zero_group = range(zero_idx * mp_size, (zero_idx + 1) * mp_size)
+        if rank in ranks_in_zero_group:
+            assert zero_local_rank == zero_idx
+
+
 def check_pipeline_parallel_rank(rank):
     mp_world_size = gpc.get_world_size(ParallelMode.MODEL)
     tp_world_size = gpc.get_world_size(ParallelMode.TENSOR)
@@ -126,6 +157,8 @@ def init_context(config_path, rank, world_size, backend, port, host):
 
     check_tensor_parallel_rank(rank)
     check_data_parallel_rank(rank)
+    check_ddp_rank(rank)
+    check_zero_parallel_rank(rank)
     check_pipeline_parallel_rank(rank)
     check_model_parallel_rank(rank)
     gpc.destroy()

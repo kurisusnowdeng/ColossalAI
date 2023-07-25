@@ -7,6 +7,8 @@ TENSOR_PARALLEL_MODE = 'tensor_parallel_mode'
 # initializer
 INITIALIZER_MAPPING = {
     'data': 'Initializer_Data',
+    'ddp': 'Initializer_DDP',
+    'zero': 'Initializer_Zero',
     'tensor': 'Initializer_Tensor',
     'pipeline': 'Initializer_Pipeline',
     'embedding': 'Initializer_Embedding',
