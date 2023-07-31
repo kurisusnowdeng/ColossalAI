@@ -63,7 +63,7 @@ class ProcessGroup:
         if PYTORCHPGDICT_ is None:
             PYTORCHPGDICT_ = PyTorchProcessGroupDict()
 
-        assert torch.distributed.is_initialized(), f"ProcessGroup must be used after distributed initialized"
+        assert torch.distributed.is_initialized(), "ProcessGroup must be used after distributed initialized"
 
         self._rank = torch.distributed.get_rank()
         if rank is not None:

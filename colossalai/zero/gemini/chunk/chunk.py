@@ -6,6 +6,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from colossalai.context import ParallelMode
+from colossalai.core import global_context as gpc
 from colossalai.utils import get_current_device
 
 
@@ -61,8 +63,9 @@ class Chunk:
     def __init__(
         self,
         chunk_size: int,
-        process_group: ProcessGroup,
-        dtype: torch.dtype,
+        process_group: Optional[ProcessGroup] = None,
+        ddp_process_group: Optional[ProcessGroup] = None,
+        dtype: torch.dtype = None,
         init_device: Optional[torch.device] = None,
         cpu_shard_init: bool = False,
         keep_gathered: bool = False,
@@ -90,15 +93,17 @@ class Chunk:
         self.chunk_size = chunk_size
         self.utilized_size = 0
 
-        self.torch_pg = process_group
-        self.pg_size = dist.get_world_size(self.torch_pg)
-        self.pg_rank = dist.get_rank(self.torch_pg)
+        self.zero_group = process_group if process_group is not None else gpc.get_group(ParallelMode.ZERO)
+        self.zero_rank = dist.get_rank(group=self.zero_group)
+        self.zero_size = dist.get_world_size(group=self.zero_group)
+        self.ddp_group = ddp_process_group if ddp_process_group is not None else gpc.get_group(ParallelMode.DDP)
+        self.ddp_size = dist.get_world_size(group=self.ddp_group)
 
         # the chunk size should be divisible by the dp degree
         if not keep_gathered:
-            assert chunk_size % self.pg_size == 0
-        self.shard_size = chunk_size // self.pg_size
-        self.shard_begin = self.shard_size * self.pg_rank
+            assert chunk_size % self.zero_size == 0
+        self.shard_size = chunk_size // self.zero_size
+        self.shard_begin = self.shard_size * self.zero_rank
         self.shard_end = self.shard_begin + self.shard_size
         self.valid_end = self.shard_size
 
@@ -124,7 +129,7 @@ class Chunk:
         self.shard_device = torch.device("cpu") if cpu_shard_init else get_current_device()
 
         self.chunk_mem = self.chunk_size * self.chunk_temp.element_size()
-        self.shard_mem = self.chunk_mem // self.pg_size
+        self.shard_mem = self.chunk_mem // self.zero_size
 
         # each tensor is associated with a TensorInfo to track its meta info
         # (state, offset, end)
@@ -374,24 +379,32 @@ class Chunk:
         if self.is_gathered:
             self.__scatter()
 
+    def _reduce_across_ddp(self, tensor):
+        if self.ddp_size > 1:
+            dist.all_reduce(tensor, group=self.ddp_group)
+            tensor.div_(self.ddp_size)
+
     def reduce(self):
         """Reduce scatter all the gradients. It's an operation done in CUDA."""
         # sanity check
         assert self.is_gathered
 
-        if self.pg_size == 1:
+        if self.zero_size == 1:
             # tricky code here
             # just move cuda_global_chunk to cuda_shard
             # the communication is not necessary
             self.__scatter()
+            self._reduce_across_ddp(self.cuda_shard)
         elif self.keep_gathered:
             # we use all-reduce here
-            dist.all_reduce(self.cuda_global_chunk, group=self.torch_pg)
+            dist.all_reduce(self.cuda_global_chunk, group=self.zero_group)
+            self._reduce_across_ddp(self.cuda_global_chunk)
         else:
             self.cuda_shard = torch.empty(self.shard_size, dtype=self.dtype, device=get_current_device())
 
-            input_list = list(torch.chunk(self.cuda_global_chunk, chunks=self.pg_size, dim=0))
-            dist.reduce_scatter(self.cuda_shard, input_list, group=self.torch_pg)
+            input_list = list(torch.chunk(self.cuda_global_chunk, chunks=self.zero_size, dim=0))
+            dist.reduce_scatter(self.cuda_shard, input_list, group=self.zero_group)
+            self._reduce_across_ddp(self.cuda_shard)
 
             free_storage(self.cuda_global_chunk)
             self.is_gathered = False
@@ -496,8 +509,8 @@ class Chunk:
             assert self.cuda_shard is not None
 
             alloc_storage(self.cuda_global_chunk)
-            gather_list = list(torch.chunk(input=self.cuda_global_chunk, chunks=self.pg_size, dim=0))
-            dist.all_gather(gather_list, self.cuda_shard, self.torch_pg)
+            gather_list = list(torch.chunk(input=self.cuda_global_chunk, chunks=self.zero_size, dim=0))
+            dist.all_gather(gather_list, self.cuda_shard, self.zero_group)
 
             self.cuda_shard = None
             self.is_gathered = True

@@ -8,7 +8,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed import ProcessGroup
-from torch.distributed.distributed_c10d import _get_default_group
 
 from colossalai.checkpoint_io.utils import StateDictSharder
 from colossalai.interface import ModelWrapper
@@ -62,15 +61,20 @@ class GeminiDDP(ModelWrapper):
             Defaults to False.
         strict_ddp_mode (bool): If set to True, there is no tensor sharding, each tensor is replicated.
             Defaults to False. Users can set it to True, when they clearly know that they only need DDP.
-        scatter_after_inference (bool): If set to True, the model will be scattered after inference. This will save memory but slow down the consecutive inference.
-        mixed_precision (torch.dtype): If set to torch.float16, the model will be trained in fp16. Otherwise, the model will be trained in bf16. Defaults to torch.float16.
+        scatter_after_inference (bool): If set to True, the model will be scattered after inference.
+            This will save memory but slow down the consecutive inference.
+        mixed_precision (torch.dtype): If set to torch.float16, the model will be trained in fp16.
+            Otherwise, the model will be trained in bf16. Defaults to torch.float16.
     """
 
     def __init__(
         self,
         module: torch.nn.Module,
+        process_group: Optional[ProcessGroup] = None,
+        ddp_process_group: Optional[ProcessGroup] = None,
+        mp_process_group: Optional[ProcessGroup] = None,
         chunk_config_dict: Optional[dict] = None,
-        chunk_init_device: torch.device = torch.device("cpu"),
+        device_id: Optional[Union[int, torch.device]] = None,
         placement_policy: str = "static",
         enable_gradient_accumulation: bool = False,
         shard_param_frac: float = 1.0,  # only for static placement
@@ -83,29 +87,26 @@ class GeminiDDP(ModelWrapper):
         min_chunk_size_m: float = 32,  # chunk search options
         pin_memory: bool = False,
         force_outputs_fp32: bool = False,
-        strict_ddp_mode: bool = False,
         scatter_after_inference: bool = True,
         mixed_precision: torch.dtype = torch.float16,
-        process_group: Optional[ProcessGroup] = None,
         memstats: Optional[MemStats] = None,  # genimi memory stats
         master_weights: bool = True,
         verbose: bool = False,
     ) -> None:
         assert mixed_precision in (torch.float16, torch.bfloat16)
+        self.device_id = torch.device(device_id) if device_id is not None else get_current_device()
         if chunk_config_dict is not None:
-            self.chunk_manager = ChunkManager(chunk_config_dict, chunk_init_device)
+            self.chunk_manager = ChunkManager(chunk_config_dict, self.device_id)
         else:
             # some ugly hotfix for the compatibility with Lightning
             if search_range_m is None:
                 search_range_m = 32
             self.chunk_manager = init_chunk_manager(
                 model=module,
-                init_device=chunk_init_device,
+                init_device=self.device_id,
                 hidden_dim=hidden_dim,
                 search_range_m=search_range_m,
                 min_chunk_size_m=min_chunk_size_m,
-                strict_ddp_flag=strict_ddp_mode,
-                process_group=process_group,
                 verbose=verbose,
             )
         self.gemini_manager = GeminiManager(
@@ -128,7 +129,10 @@ class GeminiDDP(ModelWrapper):
         self.name2param: Dict[str, nn.Parameter] = dict()
         self.scatter_after_inference = scatter_after_inference
         self.mixed_precision = mixed_precision
-        self.dp_process_group = process_group or _get_default_group()
+
+        self.zero_group = process_group if process_group is not None else dist.distributed_c10d._get_default_group()
+        self.ddp_group = ddp_process_group
+        self.mp_group = mp_process_group
 
         self.reuse_fp16_chunk = master_weights
         self.master_weights = master_weights
@@ -158,10 +162,7 @@ class GeminiDDP(ModelWrapper):
                 self.name2param[param_name] = p_var
 
         self._init_chunks(
-            param_order=param_order,
-            strict_ddp_mode=strict_ddp_mode,
-            cpu_offload=self.gemini_manager.policy_name != "cuda",
-            pin_memory=pin_memory,
+            param_order=param_order, cpu_offload=self.gemini_manager.policy_name != "cuda", pin_memory=pin_memory
         )
         super().__init__(module)
         self._non_persistent_buffers_set = self._get_non_persistent_buffers_set(module)
@@ -320,7 +321,10 @@ class GeminiDDP(ModelWrapper):
         if self.enable_gradient_accumulation and not self.accumulating_grads:
             self.accumulating_grads = True  # Turn on the state of gradient accumulation.
         self._logger.debug(
-            f"comp cuda demand time: {self.gemini_manager._comp_cuda_demand_time}, layout time: {self.gemini_manager._layout_time}, evict time: {self.gemini_manager._evict_time}, CPU->CUDA vol: {self.gemini_manager._h2d_volume}B, CUDA->CPU vol: {self.gemini_manager._d2h_volume}"
+            f"comp cuda demand time: {self.gemini_manager._comp_cuda_demand_time}, "
+            f"layout time: {self.gemini_manager._layout_time}, "
+            f"evict time: {self.gemini_manager._evict_time}, "
+            f"CPU->CUDA vol: {self.gemini_manager._h2d_volume}B, CUDA->CPU vol: {self.gemini_manager._d2h_volume}"
         )
         self.gemini_manager.post_iter()
 
@@ -376,9 +380,9 @@ class GeminiDDP(ModelWrapper):
                     else:
                         self.chunk_manager.release_chunk(chunk)
                 if grad_chunk.is_gathered:
-                    grad_chunk.cuda_global_chunk.div_(chunk.pg_size)
+                    grad_chunk.cuda_global_chunk.div_(chunk.zero_size)
                 else:
-                    grad_chunk.cuda_shard.div_(chunk.pg_size)
+                    grad_chunk.cuda_shard.div_(chunk.zero_size)
                 # check overflow elements
                 self.overflow_counter += grad_chunk.has_inf_or_nan
                 # record l2 norm for gradient clipping. flag is bound to fp16 chunk
@@ -440,7 +444,7 @@ class GeminiDDP(ModelWrapper):
 
         for tensor, tensor_info in chunk.tensors_info.items():
             record_tensor = torch.empty([0])
-            record_flag = (not only_rank_0) | (dist.get_rank(chunk.torch_pg) == 0)
+            record_flag = (not only_rank_0) | (dist.get_rank(chunk.zero_group) == 0)
             if record_flag:
                 record_tensor = temp_chunk[tensor_info.offset : tensor_info.end].view(tensor.shape).to(tensor.device)
                 if is_distributed_tensor(tensor):
@@ -732,8 +736,7 @@ class GeminiDDP(ModelWrapper):
                     if input_name not in local_state:
                         unexpected_keys.append(key)
 
-    def _init_chunks(self, param_order, strict_ddp_mode: bool, cpu_offload: bool, pin_memory: bool):
-        dp_world_size = dist.get_world_size(self.dp_process_group)
+    def _init_chunks(self, param_order, cpu_offload: bool, pin_memory: bool):
         for p in param_order.generate():
             self._preprocess_param(p)
             assert type(p) is ColoParameter
@@ -753,8 +756,8 @@ class GeminiDDP(ModelWrapper):
             self.chunk_manager.register_tensor(
                 tensor=p,
                 group_type="fp16_param",
-                config_key=dp_world_size,
-                process_group=self.dp_process_group,
+                process_group=self.zero_group,
+                ddp_process_group=self.ddp_group,
                 cpu_offload=cpu_offload,
                 pin_memory=pin_memory,
             )
@@ -767,8 +770,8 @@ class GeminiDDP(ModelWrapper):
                 self.chunk_manager.register_tensor(
                     tensor=fp32_p,
                     group_type="fp32_param",
-                    config_key=dp_world_size,
-                    process_group=self.dp_process_group,
+                    process_group=self.zero_group,
+                    ddp_process_group=self.ddp_group,
                     cpu_offload=cpu_offload,
                     pin_memory=pin_memory,
                 )
@@ -804,6 +807,8 @@ class GeminiDDP(ModelWrapper):
             # model is initialized with ColoInitContext
             return
         requires_grad = p.requires_grad
+        if p.is_meta:
+            p = torch.nn.Parameter(torch.empty_like(p, device=self.device_id))
         if isinstance(p, LazyTensor):
             # model is initialized with LazyInitContext
             p.materialize()
@@ -817,7 +822,8 @@ class GeminiDDP(ModelWrapper):
         max_shard_size: int = 1024,
         only_rank_0: bool = True,
     ) -> Iterator[Tuple[OrderedDict, int]]:
-        """Returns dictionaries containing a whole state of the module one by one. The max size of dictionary shard is specified by ``max_shard_size``.
+        """Returns dictionaries containing a whole state of the module one by one. The max size of
+        dictionary shard is specified by ``max_shard_size``.
 
         Both parameters and persistent buffers (e.g. running averages) are included.
         Keys are corresponding parameter and buffer names.

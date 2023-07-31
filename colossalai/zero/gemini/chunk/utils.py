@@ -50,5 +50,5 @@ def init_chunk_manager(
         )
     dist.barrier()
 
-    chunk_manager = ChunkManager(config_dict, init_device)
+    chunk_manager = ChunkManager(config_dict, init_device=init_device)
     return chunk_manager
