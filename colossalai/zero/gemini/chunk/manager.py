@@ -22,10 +22,10 @@ class ChunkManager:
     def __init__(self, chunk_configuration, init_device: Optional[torch.device] = None) -> None:
 
         self.device = init_device or get_current_device()
-        self.dp_degree_chunk_size_dict: Dict[int, int] = dict()
+        self.zero_degree_chunk_size_dict: Dict[int, int] = dict()
         self.kwargs_config = chunk_configuration
         for k, v in self.kwargs_config.items():
-            self.dp_degree_chunk_size_dict[k] = v.pop('chunk_size')
+            self.zero_degree_chunk_size_dict[k] = v.pop('chunk_size')
             v['init_device'] = self.device
 
         self.chunk_groups: Dict[str, Deque[Chunk]] = dict()
@@ -37,8 +37,9 @@ class ChunkManager:
     def register_tensor(self,
                         tensor: torch.Tensor,
                         group_type: str,
-                        config_key: int,
                         process_group: ProcessGroup,
+                        ddp_process_group: ProcessGroup = None,
+                        config_key: int = None,
                         cpu_offload: bool = False,
                         pin_memory: bool = False) -> None:
         """
@@ -54,9 +55,11 @@ class ChunkManager:
         """
         assert tensor not in self.tensor_chunk_map
         assert isinstance(tensor, torch.Tensor), "Please feed Tensor to this ChunkManager"
-        assert config_key in self.dp_degree_chunk_size_dict
 
-        chunk_size = self.dp_degree_chunk_size_dict[config_key]
+        config_key = dist.get_world_size(process_group)
+        assert config_key in self.zero_degree_chunk_size_dict
+
+        chunk_size = self.zero_degree_chunk_size_dict[config_key]
         chunk_kwargs = self.kwargs_config[config_key]
         group_name = "{}_{}".format(group_type, config_key)
         chunk_group = self.__get_chunk_group(group_name)
@@ -81,6 +84,7 @@ class ChunkManager:
             chunk = Chunk(
                 chunk_size=chunk_size,
                 process_group=process_group,
+                ddp_process_group=ddp_process_group,
                 dtype=tensor.dtype,
                 cpu_shard_init=cpu_offload,
                 pin_memory=pin_memory,

@@ -44,7 +44,7 @@ def exam_chunk_manager():
                                        min_chunk_size_m=0,
                                        filter_exlarge_params=True,
                                        strict_ddp_flag=True)
-    config_dict = chunk_manager.dp_degree_chunk_size_dict
+    config_dict = chunk_manager.zero_degree_chunk_size_dict
     assert len(config_dict) == 1
     assert config_dict[world_size] == 31616
 

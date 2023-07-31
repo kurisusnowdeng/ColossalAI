@@ -107,6 +107,11 @@ class GeminiOptimizer(OptimizerWrapper):
         self.verbose = verbose
         self.param_groups_backup = list()
 
+        self.zero_group = self.module.zero_group
+        self.zero_size = dist.get_world_size(self.zero_group)
+        self.mp_group = self.module.mp_group
+        self.mp_size = dist.get_world_size(self.mp_group)
+
         # Mapping from integer id to real/fake param tensor, used for checkpointing.
         self.id_to_real_params: Dict[int, Parameter] = dict()
         self.id_to_fake_params: Dict[int, Parameter] = dict()
@@ -185,29 +190,30 @@ class GeminiOptimizer(OptimizerWrapper):
             c16.l2_norm = None
 
     def _calc_global_norm(self) -> float:
-        norm_sqr: float = 0.0
-        group_to_norm = dict()
+        total_norm = 0.0
         for c16 in self.chunk16_set:
             assert c16.l2_norm is not None
 
             if c16.is_gathered:
-                norm_sqr += c16.l2_norm
+                total_norm += c16.l2_norm / self.zero_size
             else:
                 # this chunk is sharded, use communication to collect total norm
-                if c16.torch_pg not in group_to_norm:
-                    group_to_norm[c16.torch_pg] = 0.0
-                group_to_norm[c16.torch_pg] += c16.l2_norm
+                total_norm += c16.l2_norm
 
-            c16.l2_norm = None    # clear l2 norm
+            c16.l2_norm = None  # clear l2 norm
 
-        comm_buffer = torch.zeros(1, dtype=torch.float, device=get_current_device())
-        for group, part_norm in group_to_norm.items():
-            comm_buffer.fill_(part_norm)
-            dist.all_reduce(comm_buffer, group=group)
-            norm_sqr += comm_buffer.item()
+        total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
+        if self.zero_size > 1:
+            dist.all_reduce(total_norm_cuda, op=torch.distributed.ReduceOp.SUM, group=self.zero_group)
+        if self.mp_size > 1:
+            dist.all_reduce(tensor=total_norm_cuda, op=torch.distributed.ReduceOp.SUM, group=self.mp_group)
 
-        global_norm = math.sqrt(norm_sqr)
-        return global_norm
+        total_norm = total_norm_cuda[0].item()**0.5
+
+        if total_norm == float('inf') or total_norm == -float('inf') or total_norm != total_norm:
+            total_norm = -1
+
+        return total_norm
 
     def _get_combined_scale(self):
         div_scale = self.mix_precision_mixin.get_grad_div_scale()
@@ -231,8 +237,8 @@ class GeminiOptimizer(OptimizerWrapper):
         if self.mix_precision_mixin.should_skip_step():
             if self.verbose:
                 self._logger.info(f'Found overflow. Skip step')
-            self._clear_global_norm()    # clear recorded norm
-            self.zero_grad()    # reset all gradients
+            self._clear_global_norm()  # clear recorded norm
+            self.zero_grad()  # reset all gradients
             self._update_fp16_params()
             return
 
@@ -387,7 +393,7 @@ class GeminiOptimizer(OptimizerWrapper):
         param = self.id_to_real_params[param_id]
         fake_param = self.id_to_fake_params.get(param_id, None)
         chunk = self.chunk_manager.get_chunk(param)
-        process_group = chunk.torch_pg
+        process_group = chunk.zero_group
         rank = dist.get_rank(process_group)
         master_rank = 0
         collected_states = {}
@@ -642,7 +648,7 @@ class GeminiOptimizer(OptimizerWrapper):
         updated_states = dict()
         for k, v in saved_states.items():
             updated_states[k] = cast(fake_param, state_range, v, k)
-            del v    # clean loaded states
+            del v  # clean loaded states
         self.optim.state[fake_param].update(updated_states)
 
     def load_param_states(self, param_states: dict):
@@ -658,7 +664,7 @@ class GeminiOptimizer(OptimizerWrapper):
 
     def optimizer_loading_epilogue(self):
         # Epilogue when loading state_dict to pytorch optimizer.
-        self.optim._hook_for_profile()    # To support multiprocessing pickle/unpickle.
+        self.optim._hook_for_profile()  # To support multiprocessing pickle/unpickle.
         self.optim.defaults.setdefault('differentiable', False)
 
     def load_state_dict(self, state_dict: dict):

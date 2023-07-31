@@ -8,9 +8,10 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed import ProcessGroup
-from torch.distributed.distributed_c10d import _get_default_group
 
-from colossalai.checkpoint_io.utils import StateDictSharder, calculate_tensor_size
+from colossalai.checkpoint_io.utils import StateDictSharder
+from colossalai.context import ParallelMode
+from colossalai.core import global_context as gpc
 from colossalai.interface import ModelWrapper
 from colossalai.lazy import LazyTensor
 from colossalai.logging import get_dist_logger
@@ -49,46 +50,48 @@ class GeminiDDP(ModelWrapper):
             Defaults to False.
         strict_ddp_mode (bool): If set to True, there is no tensor sharding, each tensor is replicated.
             Defaults to False. Users can set it to True, when they clearly know that they only need DDP.
-        scatter_after_inference (bool): If set to True, the model will be scattered after inference. This will save memory but slow down the consecutive inference.
-        mixed_precision (torch.dtype): If set to torch.float16, the model will be trained in fp16. Otherwise, the model will be trained in bf16. Defaults to torch.float16.
+        scatter_after_inference (bool): If set to True, the model will be scattered after inference.
+            This will save memory but slow down the consecutive inference.
+        mixed_precision (torch.dtype): If set to torch.float16, the model will be trained in fp16.
+            Otherwise, the model will be trained in bf16. Defaults to torch.float16.
     """
 
     def __init__(
             self,
             module: torch.nn.Module,
+            process_group: Optional[ProcessGroup] = None,
+            ddp_process_group: Optional[ProcessGroup] = None,
+            mp_process_group: Optional[ProcessGroup] = None,
             chunk_config_dict: Optional[dict] = None,
-            chunk_init_device: torch.device = torch.device('cpu'),
+            device_id: Optional[Union[int, torch.device]] = None,
             placement_policy: str = "static",
-            shard_param_frac: float = 1.0,    # only for static placement
-            offload_optim_frac: float = 0.0,    # only for static placement
-            offload_param_frac: float = 0.0,    # only for static placement
-            warmup_non_model_data_ratio: float = 0.8,    # only for auto placement
-            steady_cuda_cap_ratio: float = 0.9,    # only for auto placement
-            search_range_m: int = 32,    # chunk search options
-            hidden_dim: Optional[int] = None,    # chunk search options
-            min_chunk_size_m: float = 32,    # chunk search options
+            shard_param_frac: float = 1.0,  # only for static placement
+            offload_optim_frac: float = 0.0,  # only for static placement
+            offload_param_frac: float = 0.0,  # only for static placement
+            warmup_non_model_data_ratio: float = 0.8,  # only for auto placement
+            steady_cuda_cap_ratio: float = 0.9,  # only for auto placement
+            search_range_m: int = 32,  # chunk search options
+            hidden_dim: Optional[int] = None,  # chunk search options
+            min_chunk_size_m: float = 32,  # chunk search options
             pin_memory: bool = False,
             force_outputs_fp32: bool = False,
-            strict_ddp_mode: bool = False,
             scatter_after_inference: bool = True,
             mixed_precision: torch.dtype = torch.float16,
-            process_group: Optional[ProcessGroup] = None,
-            memstats: Optional[MemStats] = None,    # genimi memory stats
+            memstats: Optional[MemStats] = None,  # genimi memory stats
             verbose: bool = False) -> None:
         assert mixed_precision in (torch.float16, torch.bfloat16)
+        self.device_id = torch.device(device_id) if device_id is not None else get_current_device()
         if chunk_config_dict is not None:
-            self.chunk_manager = ChunkManager(chunk_config_dict, chunk_init_device)
+            self.chunk_manager = ChunkManager(chunk_config_dict, self.device_id)
         else:
             # some ugly hotfix for the compatibility with Lightning
             if search_range_m is None:
                 search_range_m = 32
             self.chunk_manager = init_chunk_manager(model=module,
-                                                    init_device=chunk_init_device,
+                                                    init_device=self.device_id,
                                                     hidden_dim=hidden_dim,
                                                     search_range_m=search_range_m,
                                                     min_chunk_size_m=min_chunk_size_m,
-                                                    strict_ddp_flag=strict_ddp_mode,
-                                                    process_group=process_group,
                                                     verbose=verbose)
         self.gemini_manager = GeminiManager(placement_policy,
                                             self.chunk_manager,
@@ -108,7 +111,10 @@ class GeminiDDP(ModelWrapper):
         self.name2param: Dict[str, nn.Parameter] = dict()
         self.scatter_after_inference = scatter_after_inference
         self.mixed_precision = mixed_precision
-        self.dp_process_group = process_group or _get_default_group()
+
+        self.zero_group = process_group if process_group is not None else gpc.get_group(ParallelMode.ZERO)
+        self.ddp_group = ddp_process_group if ddp_process_group is not None else gpc.get_group(ParallelMode.DDP)
+        self.mp_group = mp_process_group if mp_process_group is not None else gpc.get_group(ParallelMode.MODEL)
 
         self._logger = get_dist_logger()
 
@@ -130,7 +136,6 @@ class GeminiDDP(ModelWrapper):
                 self.name2param[param_name] = p_var
 
         self._init_chunks(param_order=param_order,
-                          strict_ddp_mode=strict_ddp_mode,
                           cpu_offload=self.gemini_manager.policy_name != 'cuda',
                           pin_memory=pin_memory)
         super().__init__(module)
@@ -292,8 +297,10 @@ class GeminiDDP(ModelWrapper):
                                f"{error_str}")
         self._setup_grads_ptr()
         self._logger.debug(
-            f'comp cuda demand time: {self.gemini_manager._comp_cuda_demand_time}, layout time: {self.gemini_manager._layout_time}, evict time: {self.gemini_manager._evict_time}, CPU->CUDA vol: {self.gemini_manager._h2d_volume}B, CUDA->CPU vol: {self.gemini_manager._d2h_volume}'
-        )
+            f"comp cuda demand time: {self.gemini_manager._comp_cuda_demand_time}, "
+            f"layout time: {self.gemini_manager._layout_time}, "
+            f"evict time: {self.gemini_manager._evict_time}, "
+            f"CPU->CUDA vol: {self.gemini_manager._h2d_volume}B, CUDA->CPU vol: {self.gemini_manager._d2h_volume}")
         self.gemini_manager.post_iter()
 
     def backward(self, loss: torch.Tensor):
@@ -321,9 +328,9 @@ class GeminiDDP(ModelWrapper):
             reduced = self.chunk_manager.reduce_chunk(chunk)
             if reduced:
                 if chunk.is_gathered:
-                    chunk.cuda_global_chunk.div_(chunk.pg_size)
+                    chunk.cuda_global_chunk.div_(chunk.zero_size)
                 else:
-                    chunk.cuda_shard.div_(chunk.pg_size)
+                    chunk.cuda_shard.div_(chunk.zero_size)
                 # check overflow elements
                 self.overflow_counter += chunk.has_inf_or_nan
                 # record l2 norm for gradient clipping
@@ -389,7 +396,7 @@ class GeminiDDP(ModelWrapper):
             temp_chunk = temp_chunk.to(dtype)
         for tensor, tensor_info in chunk.tensors_info.items():
             record_tensor = torch.empty([0])
-            record_flag = (not only_rank_0) | (dist.get_rank(chunk.torch_pg) == 0)
+            record_flag = (not only_rank_0) | (dist.get_rank(chunk.zero_group) == 0)
             if record_flag:
                 record_tensor = temp_chunk[tensor_info.offset:tensor_info.end].view(tensor.shape).cpu()
 
@@ -495,7 +502,7 @@ class GeminiDDP(ModelWrapper):
         state_dict = state_dict.copy()
         if metadata is not None:
             # mypy isn't aware that "_metadata" exists in state_dict
-            state_dict._metadata = metadata    # type: ignore[attr-defined]
+            state_dict._metadata = metadata  # type: ignore[attr-defined]
 
         prefix = ''
         local_metadata = {} if metadata is None else metadata.get(prefix[:-1], {})
@@ -504,8 +511,8 @@ class GeminiDDP(ModelWrapper):
         if strict:
             if len(unexpected_keys) > 0:
                 error_msgs.insert(
-                    0, 'Unexpected key(s) in state_dict: {}. '.format(', '.join(
-                        '"{}"'.format(k) for k in unexpected_keys)))
+                    0, 'Unexpected key(s) in state_dict: {}. '.format(', '.join('"{}"'.format(k)
+                                                                                for k in unexpected_keys)))
             if len(missing_keys) > 0:
                 error_msgs.insert(
                     0, 'Missing key(s) in state_dict: {}. '.format(', '.join('"{}"'.format(k) for k in missing_keys)))
@@ -638,8 +645,7 @@ class GeminiDDP(ModelWrapper):
                     if input_name not in local_state:
                         unexpected_keys.append(key)
 
-    def _init_chunks(self, param_order, strict_ddp_mode: bool, cpu_offload: bool, pin_memory: bool):
-        dp_world_size = dist.get_world_size(self.dp_process_group)
+    def _init_chunks(self, param_order, cpu_offload: bool, pin_memory: bool):
         for p in param_order.generate():
             self._preprocess_param(p)
             assert type(p) is ColoParameter
@@ -661,14 +667,14 @@ class GeminiDDP(ModelWrapper):
             # register the fp16 parameter and fp32 parameter in the chunk manager
             self.chunk_manager.register_tensor(tensor=p,
                                                group_type='fp16_param',
-                                               config_key=dp_world_size,
-                                               process_group=self.dp_process_group,
+                                               process_group=self.zero_group,
+                                               ddp_process_group=self.ddp_group,
                                                cpu_offload=cpu_offload,
                                                pin_memory=pin_memory)
             self.chunk_manager.register_tensor(tensor=fp32_p,
                                                group_type='fp32_param',
-                                               config_key=dp_world_size,
-                                               process_group=self.dp_process_group,
+                                               process_group=self.zero_group,
+                                               ddp_process_group=self.ddp_group,
                                                cpu_offload=cpu_offload,
                                                pin_memory=pin_memory)
 
@@ -703,6 +709,8 @@ class GeminiDDP(ModelWrapper):
             # model is initialized with ColoInitContext
             return
         requires_grad = p.requires_grad
+        if p.is_meta:
+            p = torch.nn.Parameter(torch.empty_like(p, device=self.device_id))
         if isinstance(p, LazyTensor):
             # model is initialized with LazyInitContext
             p.materialize()
@@ -715,7 +723,8 @@ class GeminiDDP(ModelWrapper):
                          max_shard_size: int = 1024,
                          only_rank_0: bool = True,
                          dtype: torch.dtype = torch.float16) -> Iterator[Tuple[OrderedDict, int]]:
-        """Returns dictionaries containing a whole state of the module one by one. The max size of dictionary shard is specified by ``max_shard_size``.
+        """Returns dictionaries containing a whole state of the module one by one.
+        The max size of dictionary shard is specified by ``max_shard_size``.
 
         Both parameters and persistent buffers (e.g. running averages) are included.
         Keys are corresponding parameter and buffer names.

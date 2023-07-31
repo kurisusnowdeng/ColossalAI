@@ -4,6 +4,7 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed import ProcessGroup
 
 from colossalai.utils import is_ddp_ignored
 
@@ -25,7 +26,7 @@ def init_chunk_manager(model: nn.Module,
     if hidden_dim:
         search_interval = hidden_dim
     else:
-        search_interval = 1024    # defaults to 1024
+        search_interval = 1024  # defaults to 1024
     kwargs["search_interval"] = search_interval
 
     dist.barrier()
@@ -48,5 +49,5 @@ def init_chunk_manager(model: nn.Module,
               flush=True)
     dist.barrier()
 
-    chunk_manager = ChunkManager(config_dict, init_device)
+    chunk_manager = ChunkManager(config_dict, init_device=init_device)
     return chunk_manager

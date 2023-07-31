@@ -7,9 +7,6 @@ from torch import Tensor, inf
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from torch.distributed import ProcessGroup
 
-from colossalai.tensor import ColoParameter
-from colossalai.utils import is_model_parallel_parameter
-
 
 def flatten(input_):
     return _flatten_dense_tensors(input_)
@@ -114,7 +111,8 @@ def reduce_tensor_dp_group(tensor: torch.Tensor,
                            dtype: Optional[torch.dtype] = None,
                            dst_local_rank: Optional[int] = None,
                            dst_global_rank: Optional[int] = None,
-                           group: Optional[dist.ProcessGroup] = None):
+                           zero_group: Optional[dist.ProcessGroup] = None,
+                           ddp_group: Optional[dist.ProcessGroup] = None):
     """
     Reduce the tensor in the data parallel process group
 
@@ -139,7 +137,7 @@ def reduce_tensor_dp_group(tensor: torch.Tensor,
     else:
         tensor_to_reduce = tensor
 
-    world_size = dist.get_world_size(group=group)
+    world_size = dist.get_world_size(group=zero_group)
     tensor_to_reduce.div_(world_size)
 
     # if rank is None, all reduce will be used
@@ -147,13 +145,16 @@ def reduce_tensor_dp_group(tensor: torch.Tensor,
     use_all_reduce = dst_local_rank is None
 
     if use_all_reduce:
-        dist.all_reduce(tensor_to_reduce, group=group)
+        dist.all_reduce(tensor_to_reduce, group=zero_group)
     else:
-        dist.reduce(tensor=tensor_to_reduce, dst=dst_global_rank, group=group)
+        dist.reduce(tensor=tensor_to_reduce, dst=dst_global_rank, group=zero_group)
+
+    if dist.get_world_size(ddp_group) > 1:
+        dist.all_reduce(tensor_to_reduce, group=ddp_group)
 
     # recover the original dtype
     if tensor.dtype != dtype and tensor is not tensor_to_reduce:
-        local_rank = dist.get_rank(group=group)
+        local_rank = dist.get_rank(group=zero_group)
         if use_all_reduce or dst_local_rank == local_rank:
             tensor.copy_(tensor_to_reduce)
 
@@ -195,15 +196,18 @@ def calculate_global_norm_from_list(norm_list):
     return math.sqrt(total_norm)
 
 
-def compute_norm(gradients: Tensor, dp_group: ProcessGroup, tp_group: ProcessGroup, norm_type: int = 2) -> int:
+def compute_norm(gradients: Tensor,
+                 zero_group: ProcessGroup = None,
+                 mp_group: ProcessGroup = None,
+                 norm_type: int = 2) -> int:
     """Clips gradient norm of an iterable of parameters.
     This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
     added functionality to handle model parallel parameters.
 
     Args:
         gradients (Tensor): The gradients to compute norm
-        dp_group (ProcessGroup): The process group of ZeRO Data Parallelism
-        tp_group (ProcessGroup): The process group of Tensor Parallelism
+        zero_group (ProcessGroup): The process group of ZeRO Data Parallelism
+        mp_group (ProcessGroup): The process group of Model Parallelism
         norm_type (int, optional): type of the used p-norm, Can be ``'inf'`` for infinity norm. Defaults to 2.
 
     Returns:
@@ -214,10 +218,11 @@ def compute_norm(gradients: Tensor, dp_group: ProcessGroup, tp_group: ProcessGro
     if norm_type == inf:
         total_norm = max(g.data.abs().max() for g in gradients)
         total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
-        dist.all_reduce(total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=dp_group)
 
         # Take max across all GPUs.
-        if tp_group is not None:
+        if zero_group is not None:
+            dist.all_reduce(total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=zero_group)
+        if mp_group is not None:
             dist.all_reduce(tensor=total_norm_cuda, op=torch.distributed.ReduceOp.MAX)
         total_norm = total_norm_cuda[0].item()
     else:
@@ -228,10 +233,10 @@ def compute_norm(gradients: Tensor, dp_group: ProcessGroup, tp_group: ProcessGro
 
         # Sum across all model parallel GPUs.
         total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
-        torch.distributed.all_reduce(total_norm_cuda, op=torch.distributed.ReduceOp.SUM, group=dp_group)
-
-        if tp_group is not None:
-            dist.all_reduce(tensor=total_norm_cuda, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+        if zero_group is not None:
+            dist.all_reduce(total_norm_cuda, op=torch.distributed.ReduceOp.SUM, group=zero_group)
+        if mp_group is not None:
+            dist.all_reduce(tensor=total_norm_cuda, op=torch.distributed.ReduceOp.SUM, group=mp_group)
 
         total_norm = total_norm_cuda[0].item()**(1. / norm_type)
 

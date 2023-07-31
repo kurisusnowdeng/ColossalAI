@@ -18,7 +18,7 @@ def _get_my_nowrap_functions() -> Set[Callable]:
         Tensor._base.__get__,
         Tensor.grad.__get__,
         Tensor._grad.__get__,
-        Tensor.data.__get__,    # make .data returns torch.Tensor rather than ColoTensor
+        Tensor.data.__get__,  # make .data returns torch.Tensor rather than ColoTensor
     }
 
 
@@ -74,7 +74,7 @@ class ColoTensor(torch.Tensor):
             # we have to capture the `backward` function
             # and make sure that it does not in `torch._C.DisableTorchFunction()` context
             if func is torch.Tensor.backward:
-                assert len(args) == 1    # only has 1 parameter
+                assert len(args) == 1  # only has 1 parameter
                 backward_tensor = torch.Tensor(args[0])
                 tensor_kwargs = {k: torch.Tensor(v) if torch.is_tensor(v) else v for k, v in kwargs.items()}
                 return backward_tensor.backward(**tensor_kwargs)
